@@ -1,7 +1,7 @@
 'use strict';
 require('dotenv').config();
-const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
-const { Wallet }                      = require('ethers'); // v5 — Wallet only, no RPC
+// @polymarket/clob-client is ESM-only — loaded via dynamic import in init()
+const { Wallet } = require('ethers'); // v5 — Wallet only, no RPC
 const axios                           = require('axios');
 const WebSocket                       = require('ws');
 const logger                          = require('./logger');
@@ -104,6 +104,11 @@ class PolymarketClient {
     this.client     = null;   // authenticated L2 ClobClient
     this.readOnly   = true;
     this.apiCreds   = null;   // { apiKey, secret, passphrase }
+
+    // ESM module refs — populated by dynamic import in init()
+    this.ClobClient  = null;
+    this.Side        = null;
+    this.OrderType   = null;
   }
 
   _isPlaceholder(val) {
@@ -118,6 +123,23 @@ class PolymarketClient {
   // ── Init sequence ─────────────────────────────────────────────────────────
 
   async init() {
+    // Dynamic import — @polymarket/clob-client is ESM-only (Node 22+ requires this)
+    try {
+      const clobModule  = await import('@polymarket/clob-client');
+      this.ClobClient   = clobModule.ClobClient;
+      this.Side         = clobModule.Side;
+      this.OrderType    = clobModule.OrderType;
+      logger.info('[PolymarketClient.init] clob-client loaded via dynamic import');
+    } catch (err) {
+      logger.error('[PolymarketClient.init] Failed to load @polymarket/clob-client', {
+        error: err.message,
+        hint:  'Run: npm install @polymarket/clob-client'
+      });
+      stateStore.readOnly = true;
+      this.readOnly = true;
+      return;
+    }
+
     // Step 1 — Geoblock check
     try {
       const res = await axios.get(GEOBLOCK_URL, { timeout: 8000 });
@@ -167,7 +189,7 @@ class PolymarketClient {
 
     // Step 3 — Derive API credentials (L1 client, no creds yet)
     try {
-      const l1client = new ClobClient(this.host, this.chainId, this.wallet);
+      const l1client = new this.ClobClient(this.host, this.chainId, this.wallet);
       this.apiCreds  = await l1client.createOrDeriveApiKey();
       logger.info('[PolymarketClient.init] API credentials derived', {
         address: this._truncate(this.wallet.address)
@@ -185,7 +207,7 @@ class PolymarketClient {
 
     // Step 4 — Create authenticated L2 client
     try {
-      this.client = new ClobClient(
+      this.client = new this.ClobClient(
         this.host,
         this.chainId,
         this.wallet,
@@ -434,7 +456,7 @@ class PolymarketClient {
 
       // Step 3 — Slippage-protected price (round to tickSize)
       let price;
-      const clobSide = side === 'BUY' ? Side.BUY : Side.SELL;
+      const clobSide = side === 'BUY' ? this.Side.BUY : this.Side.SELL;
       if (side === 'BUY') {
         price = Math.min(bestAsk + 0.02, 0.97);
       } else {
@@ -451,7 +473,7 @@ class PolymarketClient {
       const resp = await this.client.createAndPostMarketOrder(
         { tokenID: tokenId, side: clobSide, amount: usdcAmount, price },
         { tickSize, negRisk },
-        OrderType.FAK
+        this.OrderType.FAK
       );
 
       logger.info(`[PolymarketClient.${fn}] Order placed`, {

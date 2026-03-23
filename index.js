@@ -63,7 +63,7 @@ async function boot() {
     }
 
     // 2. Init Gemini validator
-    geminiValidator.init();
+    await geminiValidator.init();
 
     // 2b. Connect to Supabase
     logger.info('[Boot] Connecting to Supabase…');

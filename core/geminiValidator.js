@@ -1,6 +1,6 @@
 'use strict';
 require('dotenv').config();
-const { GoogleGenAI } = require('@google/genai');
+// @google/genai is ESM-only — loaded via dynamic import in init()
 const logger = require('./logger');
 
 // ── Validator prompt ──────────────────────────────────────────────────────────
@@ -65,16 +65,17 @@ class GeminiValidator {
     this.searchUsedCount = 0;
   }
 
-  init() {
+  async init() {
     if (!this.apiKey || this.apiKey === 'your_gemini_api_key_here') {
       logger.info('GeminiValidator: no key — disabled');
       return;
     }
     try {
+      const { GoogleGenAI } = await import('@google/genai');
       this.genAI   = new GoogleGenAI({ apiKey: this.apiKey });
       this.enabled = true;
       logger.info('GeminiValidator: ACTIVE', {
-        model:          this.modelName,
+        model:           this.modelName,
         searchGrounding: true
       });
     } catch (e) {
