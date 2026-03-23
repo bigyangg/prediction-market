@@ -227,6 +227,27 @@ prediction-market/
 
 ---
 
+## Recent Updates (v2.0)
+
+### 1. RiskManager Enhancements
+- **Simulation Mode**: Added `simulationMode` detector that automatically relaxes thresholds when no real private key is set (`minEdge` = 3%, `minConf` = 45%).
+- **Improved Logging**: Rejection messages now show exact values vs thresholds. The `baseAgent` logs a detailed Judge block after Sonnet decisions. `getStats()` outputs comprehensive trade details.
+
+### 2. Sharp Trader Tracking
+- **`traderTracker` Engine**: Fetches Polymarket's weekly leaderboard and dynamically tracks actions from top traders.
+- **Signal Generation**: Compiles the last 48h trades + current holdings (≥10 shares) and injects a "SHARP TRADER ACTIVITY" block into the Sonnet prompt for edge discovery.
+- **Dashboard UI**: New Sharp Traders panel included on the dashboard with capabilities to manually add traders and auto-refresh feed visuals.
+
+### 3. GNews Cache Fix
+- Supabase news cache TTL increased from 5 to 30 minutes to efficiently protect the 100/day GNews API budget.
+
+### 4. Cloud Deployment Architecture
+- **Railway Configuration**: Full `railway.json` and `.railwayignore` added. See `DEPLOY.md` for a comprehensive step-by-step deploy guide.
+- **Single Port System**: HTTP dashboard and WebSocket now seamlessly share a single port (Dashboard on `/`, WebSocket on `/ws`).
+- **Healthchecks**: Added `/health` endpoint and adjusted logging for cloud environments.
+
+---
+
 ## Disclaimer
 
 This software is provided for educational and experimental purposes. Prediction market trading involves substantial risk of loss. The authors are not responsible for any financial losses incurred while using this system. Always test in READ-ONLY simulation mode before deploying with real funds.
