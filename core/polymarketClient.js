@@ -1,0 +1,554 @@
+'use strict';
+require('dotenv').config();
+const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
+const { Wallet, ethers }              = require('ethers'); // v5
+const axios                           = require('axios');
+const WebSocket                       = require('ws');
+const logger                          = require('./logger');
+const stateStore                      = require('./stateStore');
+
+const GAMMA_API     = process.env.GAMMA_API_URL || 'https://gamma-api.polymarket.com';
+const DATA_API      = 'https://data-api.polymarket.com';
+const USER_WS_URL   = 'wss://ws-subscriptions-clob.polymarket.com/ws/user';
+const GEOBLOCK_URL  = 'https://polymarket.com/api/geoblock';
+const CLOB_HOST     = process.env.CLOB_API_URL  || 'https://clob.polymarket.com';
+const CHAIN_ID      = 137; // Polygon mainnet
+
+// USDC on Polygon (fallback balance check)
+const USDC_ADDRESS = process.env.USDC_CONTRACT || '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const USDC_ABI     = [
+  'function balanceOf(address owner) view returns (uint256)'
+];
+
+// Multiple public Polygon RPC endpoints — tried in order
+const POLYGON_RPCS = [
+  process.env.POLYGON_RPC_URL,
+  'https://polygon-rpc.com',
+  'https://rpc-mainnet.matic.network',
+  'https://rpc-mainnet.maticvigil.com',
+  'https://polygon.llamarpc.com',
+  'https://rpc.ankr.com/polygon'
+].filter(Boolean);
+
+// ── Market normalizer ────────────────────────────────────────────────────────
+function mapMarket(m) {
+  if (!m?.id) return null;
+
+  const safeParseArr = (str) => {
+    try { return str ? JSON.parse(str) : []; } catch { return []; }
+  };
+
+  const tokenIds  = safeParseArr(m.clobTokenIds);   // ["tokenA","tokenB"]
+  const prices    = safeParseArr(m.outcomePrices);  // ["0.6","0.4"]
+  const outcomes  = safeParseArr(m.outcomes);       // ["Yes","No"]
+
+  const liquidity  = parseFloat(m.liquidityNum  ?? m.liquidityClob  ?? m.liquidity  ?? 0);
+  const volume24hr = parseFloat(m.volume24hr    ?? m.volumeNum      ?? 0);
+
+  const lastPrice = parseFloat(m.lastTradePrice ?? m.bestAsk ?? prices[0] ?? 0.5);
+
+  const tokens = tokenIds.map((id, i) => ({
+    token_id: id,
+    outcome:  outcomes[i] || (i === 0 ? 'Yes' : 'No')
+  }));
+
+  return {
+    id:              m.id,
+    conditionId:     m.conditionId,
+    question:        m.question || 'Unknown',
+    category:        m.categories?.[0]?.label || m.category || 'General',
+    endDate:         m.endDate || m.endDateIso,
+    volume24hr,
+    liquidity,
+    bestAsk:         parseFloat(m.bestAsk  ?? lastPrice + 0.01),
+    bestBid:         parseFloat(m.bestBid  ?? lastPrice - 0.01),
+    lastPrice,
+    marketProb:      Math.round(lastPrice * 100),
+    tokens,
+    tokenIds,
+    active:          m.active !== false,
+    closed:          m.closed === true,
+    acceptingOrders: m.acceptingOrders !== false,
+    negRisk:         m.negRisk || false,
+    minimumTickSize: m.orderPriceMinTickSize?.toString() || '0.01',
+    slug:            m.slug || '',
+    spread:          m.spread || null
+  };
+}
+
+function filterAndReturn(markets, limit) {
+  return markets
+    .filter(m =>
+      m.volume24hr > 100 &&
+      m.liquidity  > 200 &&
+      !m.closed &&
+      m.active &&
+      m.acceptingOrders &&
+      m.marketProb >= 3 &&
+      m.marketProb <= 97 &&
+      m.question !== 'Unknown' &&
+      m.tokenIds.length > 0
+    )
+    .filter(m => !/\b5-?min/i.test(m.question))
+    .filter(m => !/\b15-?min/i.test(m.question))
+    .slice(0, limit);
+}
+
+// ── Structured error logger ───────────────────────────────────────────────────
+function apiError(fn, err, extra = {}) {
+  const status = err.response?.status || err.code || 'UNKNOWN';
+  const detail = err.response?.data   || err.message;
+  if (status === 401 || status === 403) {
+    logger.error(`[PolymarketClient.${fn}] AUTH FAILED`, { status, detail, ...extra, hint: 'Check POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS' });
+  } else if (status === 429) {
+    logger.error(`[PolymarketClient.${fn}] RATE LIMITED`, { status, ...extra, hint: 'Back off or reduce scan frequency' });
+  } else if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+    logger.warn(`[PolymarketClient.${fn}] TIMED OUT`, extra);
+  } else {
+    logger.warn(`[PolymarketClient.${fn}] FAILED`, { status, detail, ...extra });
+  }
+}
+
+class PolymarketClient {
+  constructor() {
+    this.host       = CLOB_HOST;
+    this.chainId    = CHAIN_ID;
+    this.sigType    = parseInt(process.env.POLYMARKET_SIGNATURE_TYPE) || 1;
+    this.funder     = process.env.POLYMARKET_FUNDER_ADDRESS || null;
+    this.privateKey = process.env.POLYMARKET_PRIVATE_KEY    || null;
+    this.wallet     = null;
+    this.client     = null;   // authenticated L2 ClobClient
+    this.readOnly   = true;
+    this.apiCreds   = null;   // { apiKey, secret, passphrase }
+  }
+
+  _isPlaceholder(val) {
+    return !val || val.startsWith('your_') || val.startsWith('your-');
+  }
+
+  _truncate(addr) {
+    if (!addr) return 'N/A';
+    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+  }
+
+  // ── Init sequence ─────────────────────────────────────────────────────────
+
+  async init() {
+    // Step 1 — Geoblock check
+    try {
+      const res = await axios.get(GEOBLOCK_URL, { timeout: 8000 });
+      if (res.data?.blocked === true) {
+        logger.error('[PolymarketClient.init] GEOBLOCK: Trading not available in your region', {
+          country: res.data.country || 'unknown',
+          hint: 'Polymarket is geo-restricted — use a compliant jurisdiction'
+        });
+        stateStore.readOnly = true;
+        this.readOnly = true;
+        return;
+      }
+      logger.info('[PolymarketClient.init] Geoblock check passed', {
+        country: res.data?.country || 'unknown'
+      });
+    } catch (err) {
+      // Non-fatal — continue if geoblock endpoint is unreachable
+      logger.warn('[PolymarketClient.init] Geoblock check skipped', {
+        error: err.message, hint: 'Could not reach geoblock API — proceeding'
+      });
+    }
+
+    // Step 2 — Wallet setup
+    if (this._isPlaceholder(this.privateKey)) {
+      logger.warn('[PolymarketClient.init] No POLYMARKET_PRIVATE_KEY — READ-ONLY mode', {
+        hint: 'Set POLYMARKET_PRIVATE_KEY in .env to enable live trading'
+      });
+      stateStore.readOnly = true;
+      this.readOnly = true;
+      return;
+    }
+
+    try {
+      this.wallet = new Wallet(this.privateKey);
+      logger.info('[PolymarketClient.init] Wallet loaded', {
+        address: this._truncate(this.wallet.address)
+      });
+    } catch (err) {
+      logger.error('[PolymarketClient.init] Wallet creation FAILED', {
+        error: err.message,
+        hint: 'Check POLYMARKET_PRIVATE_KEY format — 32-byte hex, with or without 0x prefix'
+      });
+      stateStore.readOnly = true;
+      this.readOnly = true;
+      return;
+    }
+
+    // Step 3 — Derive API credentials (L1 client, no creds yet)
+    try {
+      const l1client = new ClobClient(this.host, this.chainId, this.wallet);
+      this.apiCreds  = await l1client.createOrDeriveApiKey();
+      logger.info('[PolymarketClient.init] API credentials derived', {
+        address: this._truncate(this.wallet.address)
+      });
+      // Log creds clearly for debugging (operator can copy these)
+      logger.info('POLY_API_KEY=' + this.apiCreds.apiKey);
+      logger.info('POLY_SECRET='  + this.apiCreds.secret);
+      logger.info('POLY_PASSPHRASE=' + this.apiCreds.passphrase);
+    } catch (err) {
+      apiError('init.deriveApiKey', err, { address: this._truncate(this.wallet?.address) });
+      stateStore.readOnly = true;
+      this.readOnly = true;
+      return;
+    }
+
+    // Step 4 — Create authenticated L2 client
+    try {
+      this.client = new ClobClient(
+        this.host,
+        this.chainId,
+        this.wallet,
+        this.apiCreds,
+        this.sigType,
+        this.funder || undefined
+      );
+      this.readOnly = false;
+      stateStore.readOnly = false;
+      logger.info('[PolymarketClient.init] Authenticated L2 client ready', {
+        sigType: this.sigType,
+        funder:  this._truncate(this.funder)
+      });
+    } catch (err) {
+      apiError('init.l2client', err);
+      stateStore.readOnly = true;
+      this.readOnly = true;
+      return;
+    }
+
+    // Step 5 — Get initial USDC balance
+    try {
+      const balance = await this.getUSDCBalance();
+      stateStore.setWallet(
+        this.funder || this.wallet.address,
+        parseFloat(balance)
+      );
+      logger.info(`[PolymarketClient.init] Wallet ready — USDC balance: $${balance}`);
+    } catch (err) {
+      logger.warn('[PolymarketClient.init] Could not fetch initial USDC balance', { error: err.message });
+    }
+
+    // Step 6 — Heartbeat (CRITICAL — keeps WS session alive)
+    let heartbeatId = '';
+    setInterval(async () => {
+      try {
+        const resp = await this.client.postHeartbeat(heartbeatId);
+        heartbeatId = resp?.heartbeat_id || heartbeatId;
+      } catch (e) {
+        logger.warn('[PolymarketClient] Heartbeat failed — retrying next interval', { error: e.message });
+      }
+    }, 5000);
+    logger.info('[PolymarketClient.init] Heartbeat started (5s interval)');
+
+    // Step 7 — User WebSocket for instant trade confirmation
+    this.connectUserWebSocket();
+  }
+
+  // ── USDC Balance ──────────────────────────────────────────────────────────
+
+  async getUSDCBalance() {
+    // In read-only mode with no wallet — return 0 cleanly
+    if (this.readOnly || !this.funder) return '0.00';
+
+    // Primary: clob-client (no RPC needed)
+    if (this.client) {
+      try {
+        const data    = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const balance = data?.balance ?? data?.allowance ?? null;
+        if (balance !== null) return parseFloat(balance).toFixed(2);
+      } catch (err) {
+        logger.debug('[PolymarketClient.getUSDCBalance] CLOB balance failed — trying RPC', {
+          error: err.message
+        });
+      }
+    }
+
+    // Fallback: try each Polygon RPC endpoint in turn
+    const addr = this.funder || this.wallet?.address;
+    if (!addr) return '0.00';
+
+    for (const rpc of POLYGON_RPCS) {
+      try {
+        const provider = new ethers.providers.JsonRpcProvider(rpc);
+        provider.pollingInterval = 4000;
+        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
+        const raw  = await Promise.race([
+          usdc.balanceOf(addr),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+        ]);
+        const balance = parseFloat(ethers.utils.formatUnits(raw, 6)).toFixed(2);
+        logger.debug('[PolymarketClient.getUSDCBalance] USDC balance via RPC', { rpc, balance });
+        return balance;
+      } catch (err) {
+        logger.debug('[PolymarketClient.getUSDCBalance] RPC failed', { rpc, error: err.message });
+      }
+    }
+
+    // All RPCs failed — return 0 silently
+    logger.debug('[PolymarketClient.getUSDCBalance] all RPCs failed — returning 0');
+    return '0.00';
+  }
+
+  async refreshWallet() {
+    const balance = await this.getUSDCBalance();
+    const addr    = this.funder || this.wallet?.address || null;
+    stateStore.setWallet(addr, parseFloat(balance));
+    return { address: addr, balance };
+  }
+
+  // ── Data API — Real Positions ────────────────────────────────────────────
+
+  async getRealPositions() {
+    const fn   = 'getRealPositions';
+    const addr = this.funder || this.wallet?.address;
+    if (!addr) return [];
+    try {
+      const res = await axios.get(`${DATA_API}/positions`, {
+        params: { user: addr, sizeThreshold: 0.01, limit: 100, sortBy: 'CASHPNL', sortDirection: 'DESC' },
+        timeout: 10000
+      });
+      const positions = Array.isArray(res.data) ? res.data : [];
+      logger.info(`[PolymarketClient.${fn}] ${positions.length} positions loaded`);
+      return positions;
+    } catch (err) {
+      apiError(fn, err, { address: this._truncate(addr) });
+      return [];
+    }
+  }
+
+  async getRealTrades(limit = 50) {
+    const fn   = 'getRealTrades';
+    const addr = this.funder || this.wallet?.address;
+    if (!addr) return [];
+    try {
+      const res = await axios.get(`${DATA_API}/trades`, {
+        params: { user: addr, limit, takerOnly: false },
+        timeout: 10000
+      });
+      return Array.isArray(res.data) ? res.data : [];
+    } catch (err) {
+      apiError(fn, err, { address: this._truncate(addr) });
+      return [];
+    }
+  }
+
+  async getRealPnL() {
+    const positions = await this.getRealPositions();
+    const totalCashPnl      = positions.reduce((s, p) => s + (parseFloat(p.cashPnl)      || 0), 0);
+    const totalCurrentValue = positions.reduce((s, p) => s + (parseFloat(p.currentValue) || 0), 0);
+    const winningPositions  = positions.filter(p => parseFloat(p.cashPnl) > 0).length;
+    return {
+      totalCashPnl:      parseFloat(totalCashPnl.toFixed(4)),
+      totalCurrentValue: parseFloat(totalCurrentValue.toFixed(4)),
+      openPositionCount: positions.length,
+      winningPositions,
+      positions
+    };
+  }
+
+  // ── User WebSocket — instant trade confirmation ────────────────────────────
+
+  connectUserWebSocket() {
+    if (!this.apiCreds || this.readOnly) return;
+
+    const connect = () => {
+      const ws = new WebSocket(USER_WS_URL);
+
+      ws.on('open', () => {
+        logger.info('[PolymarketClient.userWS] Connected — subscribing to user events');
+        ws.send(JSON.stringify({
+          auth: {
+            apiKey:     this.apiCreds.apiKey,
+            secret:     this.apiCreds.secret,
+            passphrase: this.apiCreds.passphrase
+          },
+          type: 'user'
+        }));
+      });
+
+      ws.on('message', (raw) => {
+        try {
+          const msgs = JSON.parse(raw.toString());
+          const events = Array.isArray(msgs) ? msgs : [msgs];
+          for (const evt of events) {
+            if (evt.event_type === 'trade' && evt.status === 'CONFIRMED') {
+              logger.info('[PolymarketClient.userWS] Trade CONFIRMED on-chain', {
+                side:   evt.side,
+                size:   evt.size,
+                price:  evt.price,
+                market: (evt.market_id || '').slice(0, 20)
+              });
+              // Trigger immediate Data API poll — don't wait 30s
+              stateStore.emit('trigger_data_poll');
+            } else if (evt.event_type === 'order') {
+              logger.info('[PolymarketClient.userWS] Order event', {
+                status: evt.status,
+                side:   evt.side,
+                size:   evt.size
+              });
+            }
+          }
+        } catch { /* ignore malformed frames */ }
+      });
+
+      ws.on('close', () => {
+        logger.warn('[PolymarketClient.userWS] Disconnected — reconnecting in 3s');
+        setTimeout(connect, 3000);
+      });
+
+      ws.on('error', (err) => {
+        logger.warn('[PolymarketClient.userWS] Error', { error: err.message });
+        // close handler will reconnect
+      });
+    };
+
+    connect();
+    logger.info('[PolymarketClient.userWS] User WebSocket started');
+  }
+
+  // ── Gamma API — Active Markets ────────────────────────────────────────────
+
+  async getActiveMarkets({ limit = 50 } = {}) {
+    try {
+      const res = await axios.get('https://gamma-api.polymarket.com/markets', {
+        params: { active: true, closed: false, limit: 100, order: 'volume24hr', ascending: false },
+        timeout: 15000,
+        headers: { 'Accept': 'application/json' }
+      });
+
+      const raw = Array.isArray(res.data) ? res.data : [];
+      logger.info('Gamma API response', { count: raw.length, first: raw[0]?.question?.slice(0, 50) });
+
+      const markets = raw.map(m => mapMarket(m)).filter(Boolean);
+      return filterAndReturn(markets, limit);
+    } catch (err) {
+      logger.error('getActiveMarkets failed', {
+        status:       err.response?.status,
+        message:      err.message,
+        responseData: JSON.stringify(err.response?.data)?.slice(0, 300)
+      });
+      return [];
+    }
+  }
+
+  // ── Order Placement ───────────────────────────────────────────────────────
+
+  async placeOrder({ tokenId, side, usdcAmount, marketQuestion }) {
+    const fn  = 'placeOrder';
+    const ctx = { tokenId, side, usdcAmount, market: (marketQuestion || '').slice(0, 60) };
+
+    if (this.readOnly) {
+      const simId = `sim_${Date.now()}`;
+      logger.info(`[PolymarketClient.${fn}] READ-ONLY: simulated order`, { ...ctx, orderId: simId });
+      return { simulated: true, orderId: simId };
+    }
+
+    if (!this.client) {
+      logger.error(`[PolymarketClient.${fn}] No authenticated client — cannot place order`, ctx);
+      throw new Error('CLOB client not initialized');
+    }
+
+    try {
+      // Step 1 — Get market params
+      const [tickSize, negRisk] = await Promise.all([
+        this.client.getTickSize(tokenId).catch(() => 0.01),
+        this.client.getNegRisk(tokenId).catch(() => false)
+      ]);
+
+      // Step 2 — Get orderbook for best price
+      const book    = await this.client.getOrderBook(tokenId);
+      const bestAsk = parseFloat(book?.asks?.[0]?.price || 0.55);
+      const bestBid = parseFloat(book?.bids?.[0]?.price || 0.45);
+
+      // Step 3 — Slippage-protected price (round to tickSize)
+      let price;
+      const clobSide = side === 'BUY' ? Side.BUY : Side.SELL;
+      if (side === 'BUY') {
+        price = Math.min(bestAsk + 0.02, 0.97);
+      } else {
+        price = Math.max(bestBid - 0.02, 0.03);
+      }
+      const ticks = Math.round(parseFloat(tickSize) || 0.01);
+      price = Math.round(price / ticks) * ticks;
+
+      logger.info(`[PolymarketClient.${fn}] Placing FAK order`, {
+        ...ctx, price, tickSize, negRisk
+      });
+
+      // Step 4 — Place FAK market order
+      const resp = await this.client.createAndPostMarketOrder(
+        { tokenID: tokenId, side: clobSide, amount: usdcAmount, price },
+        { tickSize, negRisk },
+        OrderType.FAK
+      );
+
+      logger.info(`[PolymarketClient.${fn}] Order placed`, {
+        ...ctx, orderId: resp?.orderID || resp?.order_id, status: resp?.status
+      });
+      return resp;
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 400) {
+        logger.error(`[PolymarketClient.${fn}] Bad request — CLOB rejected order`, {
+          ...ctx, detail: err.response?.data, hint: 'Check tokenId, price, and usdcAmount'
+        });
+      } else if (status === 401 || status === 403) {
+        logger.error(`[PolymarketClient.${fn}] Auth failure`, {
+          ...ctx, hint: 'Verify POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS'
+        });
+      } else if (status === 429) {
+        logger.error(`[PolymarketClient.${fn}] Rate limited`, {
+          ...ctx, retryAfter: err.response?.headers?.['retry-after']
+        });
+      } else {
+        apiError(fn, err, ctx);
+      }
+      throw err;
+    }
+  }
+
+  async cancelOrder(orderId) {
+    const fn = 'cancelOrder';
+    if (this.readOnly) {
+      logger.info(`[PolymarketClient.${fn}] READ-ONLY: simulated cancel`, { orderId });
+      return { simulated: true };
+    }
+    try {
+      const resp = await this.client.cancelOrder({ orderID: orderId });
+      logger.info(`[PolymarketClient.${fn}] Cancelled`, { orderId });
+      return resp;
+    } catch (err) {
+      apiError(fn, err, { orderId });
+      throw err;
+    }
+  }
+
+  async getPositions() {
+    const fn = 'getPositions';
+    if (!this.client) return [];
+    try {
+      return await this.client.getPositions() || [];
+    } catch (err) {
+      apiError(fn, err);
+      return [];
+    }
+  }
+
+  async getOrderbook(tokenId) {
+    const fn = 'getOrderbook';
+    try {
+      return await this.client.getOrderBook(tokenId);
+    } catch (err) {
+      apiError(fn, err, { tokenId });
+      return null;
+    }
+  }
+}
+
+module.exports = new PolymarketClient();
