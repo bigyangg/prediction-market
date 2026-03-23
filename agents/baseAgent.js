@@ -336,10 +336,19 @@ Respond with ONLY this JSON, nothing else, no markdown:
 
       return worth;
     } catch (err) {
+      const code = this._logClaudeError(err, 'Haiku Scout', ctx);
+      if (code === 'auth_error' || code === 'credits_exhausted') {
+        logger.error(`[${this.name}] INVALID API KEY or NO CREDITS — stopping engine`);
+        stateStore.setEngineRunning(false);
+        return false;
+      }
+      if (code === 'rate_limited') {
+        logger.warn(`[${this.name}] Rate limited — pausing agent for 30 seconds`);
+        await delay(30000);
+      }
       // Fail open — Haiku errors should not block Sonnet analysis
-      this._logClaudeError(err, 'Haiku Scout', ctx);
       logger.warn(`[${this.name}] Haiku error — failing open (worth_analyzing: true)`, {
-        ...ctx, hint: 'Sonnet will make the final call'
+        hint: 'Sonnet will make the final call'
       });
       stateStore.incrementAgentCounter(this.name, 'approvedCount');
       return true;
@@ -453,7 +462,16 @@ Analyze this market for mispricing. Output valid JSON only.`;
         REASON:     decision.reason
       }));
     } catch (err) {
-      this._logClaudeError(err, 'Sonnet Judge', ctx);
+      const code = this._logClaudeError(err, 'Sonnet Judge', ctx);
+      if (code === 'auth_error' || code === 'credits_exhausted') {
+        logger.error(`[${this.name}] INVALID API KEY or NO CREDITS — stopping engine`);
+        stateStore.setEngineRunning(false);
+        return;
+      }
+      if (code === 'rate_limited') {
+        logger.warn(`[${this.name}] Rate limited — pausing agent for 30 seconds`);
+        await delay(30000);
+      }
       stateStore.addNews({ agent: this.name, text: `ERROR: Sonnet unavailable — ${question.slice(0, 50)}`, type: 'skip' });
       return;
     }
@@ -610,24 +628,56 @@ Analyze this market for mispricing. Output valid JSON only.`;
   // ── Shared Claude error logger ─────────────────────────────────────────────
 
   _logClaudeError(err, label, ctx) {
+    const hint =
+      err.status === 401 ? 'Check ANTHROPIC_API_KEY in Railway Variables' :
+      err.status === 429 ? 'Rate limited — reduce scan frequency' :
+      err.status === 402 ? 'Credits exhausted — add funds at console.anthropic.com' :
+      'Unknown error';
+
     if (err.status === 401) {
       logger.error(`[${this.name}] [${label}] AUTH FAILED`, {
-        ...ctx, hint: 'ANTHROPIC_API_KEY is invalid or expired'
+        error:   err.message,
+        status:  err.status,
+        type:    err.error?.type,
+        message: err.error?.message,
+        hint
       });
+      return 'auth_error';
+    } else if (err.status === 402) {
+      logger.error(`[${this.name}] [${label}] CREDITS EXHAUSTED`, {
+        error:   err.message,
+        status:  err.status,
+        type:    err.error?.type,
+        message: err.error?.message,
+        hint
+      });
+      return 'credits_exhausted';
     } else if (err.status === 429) {
       logger.error(`[${this.name}] [${label}] RATE LIMITED`, {
-        ...ctx, hint: 'Reduce agent scan frequency or upgrade API tier'
+        error:   err.message,
+        status:  err.status,
+        type:    err.error?.type,
+        message: err.error?.message,
+        hint
       });
+      return 'rate_limited';
     } else if (err.status === 529 || err.status === 503) {
       logger.warn(`[${this.name}] [${label}] API OVERLOADED`, {
-        ...ctx, status: err.status, hint: 'Temporary — will retry next scan cycle'
+        status: err.status, hint: 'Temporary — will retry next scan cycle'
       });
+      return 'overloaded';
     } else if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
       logger.warn(`[${this.name}] [${label}] TIMED OUT`, ctx);
+      return 'timeout';
     } else {
       logger.error(`[${this.name}] [${label}] API call FAILED`, {
-        ...ctx, error: err.message, status: err.status
+        error:   err.message,
+        status:  err.status,
+        type:    err.error?.type,
+        message: err.error?.message,
+        hint
       });
+      return 'error';
     }
   }
 
