@@ -513,7 +513,7 @@ class NewsFetcher {
     // Supabase news cache — serves same context for 5 min to protect GNews budget
     const persistence = require('./persistence');
     const cacheKey = 'news_' + category;
-    const supabaseCached = await persistence.getCachedNews(cacheKey, 5);
+    const supabaseCached = await persistence.getCachedNews(cacheKey, 30);
     if (supabaseCached) {
       logger.debug(`[NewsFetcher.${fn}] Serving from Supabase cache`);
       return supabaseCached;

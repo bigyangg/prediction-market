@@ -10,14 +10,26 @@ const riskManager = require('../core/riskManager');
 const newsFetcher     = require('../core/newsFetcher');
 const geminiValidator = require('../core/geminiValidator');
 
-const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT) || 3000;
-const WS_PORT        = parseInt(process.env.WS_PORT)        || 3001;
+const HTTP_PORT = parseInt(process.env.PORT) || parseInt(process.env.HTTP_PORT) || 3000;
 
 // ── Express app ───────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Health Check ──────────────────────────────────────────────────────────────
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    engineRunning: stateStore.engineRunning,
+    halted: stateStore.engineHalted,
+    scans: stateStore.scansCompleted,
+    timestamp: new Date().toISOString()
+  });
+});
 
 // ── REST Endpoints (SDD 5.1) ──────────────────────────────────────────────────
 
@@ -60,6 +72,25 @@ app.post('/api/risk/reset-daily', (_req, res) => {
   res.json({ ok: true, dailyPnl: 0 });
 });
 
+// GET /api/traders — sharp trader tracker summary
+app.get('/api/traders', (_req, res) => {
+  const traderTracker = require('../core/traderTracker');
+  res.json(traderTracker.getSummary());
+});
+
+// POST /api/traders/add — manually add a wallet to watch list
+app.post('/api/traders/add', (req, res) => {
+  const { address, alias } = req.body;
+  if (!address) return res.status(400).json({ error: 'address required' });
+  const traderTracker = require('../core/traderTracker');
+  if (traderTracker.wallets.find(w => w.address === address)) {
+    return res.json({ ok: true, note: 'already watching', total: traderTracker.wallets.length });
+  }
+  traderTracker.wallets.push({ address, alias: alias || 'Manual', description: 'Added via dashboard' });
+  logger.info(`Dashboard: tracking new wallet ${alias || address.slice(0, 8)}`);
+  res.json({ ok: true, total: traderTracker.wallets.length });
+});
+
 // GET /api/config — safely expose public keys for dashboard Supabase realtime
 app.get('/api/config', (_req, res) => {
   res.json({
@@ -92,13 +123,19 @@ const httpServer = http.createServer(app);
 
 // ── WebSocket Server (SDD 5.2) ────────────────────────────────────────────────
 
-const wss = new WebSocketServer({ port: WS_PORT });
+const wss = new WebSocketServer({ noServer: true });
 wss.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    logger.error(`WebSocket port ${WS_PORT} already in use — kill existing process and restart`);
-    process.exit(1);
-  }
   logger.error(`WebSocket server error: ${err.message}`, { code: err.code });
+});
+
+httpServer.on('upgrade', (request, socket, head) => {
+  if (request.url === '/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 const clients = new Set();
 
@@ -152,9 +189,12 @@ stateStore.on('trades_real',  payload => broadcast('trades_real', payload));
 
 function startDashboard() {
   return new Promise((resolve) => {
-    httpServer.listen(DASHBOARD_PORT, '127.0.0.1', () => {
-      logger.info(`Dashboard: HTTP server running at http://localhost:${DASHBOARD_PORT}`);
-      logger.info(`Dashboard: WebSocket server running on port ${WS_PORT}`);
+    httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+      logger.info(`Dashboard: http://localhost:${HTTP_PORT}`);
+      logger.info(`Dashboard: WebSocket at ws://localhost:${HTTP_PORT}/ws`);
+      if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+        logger.info(`Railway URL: https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
+      }
       resolve();
     });
   });

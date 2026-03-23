@@ -567,6 +567,10 @@
       opacity: 0.5;
     }
 
+    #news-list li.sharp_trader {
+      border-left: 2px solid #7c3aed;
+    }
+
     .nsrc {
       font-size: 9px;
       color: var(--muted);
@@ -830,6 +834,32 @@
       </div>
     </div>
 
+    <!-- Sharp Traders -->
+    <div class="panel">
+      <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center;">
+        <span class="ph-title">Sharp Traders</span>
+        <span id="trader-count" style="font-size:10px;color:var(--muted)">0 watching</span>
+      </div>
+      <div style="padding:10px">
+        <div id="traders-table-wrap" style="max-height:160px;overflow-y:auto;margin-bottom:10px;">
+          <table class="data-table" style="width:100%">
+            <thead>
+              <tr><th>Alias</th><th>Address</th><th>Positions</th><th>Trades</th></tr>
+            </thead>
+            <tbody id="traders-tbody">
+              <tr><td colspan="4" style="color:var(--muted);text-align:center;padding:12px">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <input id="trader-addr" type="text" placeholder="0x… wallet address" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:5px 8px;font-size:12px;" />
+          <input id="trader-alias" type="text" placeholder="Alias" style="width:80px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:5px 8px;font-size:12px;" />
+          <button onclick="addTrader()" style="padding:5px 10px;background:var(--accent);border:none;border-radius:4px;color:#fff;font-size:12px;cursor:pointer;white-space:nowrap;">Add</button>
+        </div>
+        <div id="trader-feedback" style="margin-top:6px;font-size:11px;color:var(--muted);"></div>
+      </div>
+    </div>
+
     <!-- Manual Trade -->
     <div class="panel">
       <div class="panel-head">
@@ -869,12 +899,15 @@
 
 <script>
 // ── WebSocket with auto-reconnect ─────────────────────────────────────────────
-const WS_URL = `ws://${location.hostname}:3001`;
+function getWSUrl() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/ws`;
+}
 const connDot = document.getElementById('conn-dot');
 let ws, reconnectTimer;
 
 function connect() {
-  ws = new WebSocket(WS_URL);
+  ws = new WebSocket(getWSUrl());
 
   ws.onopen = () => {
     connDot.className = 'connected';
@@ -1263,6 +1296,52 @@ function pnlClass(v) { return v > 0 ? 'green' : v < 0 ? 'red' : ''; }
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+// ── Sharp trader UI ───────────────────────────────────────────────────────────
+
+function loadTraders() {
+  fetch('/api/traders').then(r => r.json()).then(data => {
+    const tbody = el('traders-tbody');
+    const count = el('trader-count');
+    if (!data || !data.wallets) return;
+    count.textContent = data.wallets.length + ' watching';
+    if (!data.wallets.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:12px">None yet — auto-discovery running</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.wallets.map(w => `<tr>
+      <td style="font-weight:600">${escHtml(w.alias)}</td>
+      <td style="color:var(--muted);font-family:monospace">${escHtml(w.address)}</td>
+      <td style="text-align:center">${w.positions}</td>
+      <td style="text-align:center">${w.recentTrades}</td>
+    </tr>`).join('');
+  }).catch(() => {});
+}
+
+async function addTrader() {
+  const address = (el('trader-addr').value || '').trim();
+  const alias   = (el('trader-alias').value || '').trim();
+  const fb      = el('trader-feedback');
+  if (!address) { fb.textContent = 'Enter a wallet address.'; return; }
+  fb.textContent = 'Adding…';
+  try {
+    const res = await api('POST', '/api/traders/add', { address, alias });
+    if (res && res.ok) {
+      fb.textContent = `Watching ${res.total} wallets.`;
+      el('trader-addr').value  = '';
+      el('trader-alias').value = '';
+      loadTraders();
+    } else {
+      fb.textContent = res?.error || 'Failed.';
+    }
+  } catch (e) {
+    fb.textContent = 'Request failed.';
+  }
+}
+
+// Refresh trader table every 2 minutes
+loadTraders();
+setInterval(loadTraders, 120000);
 
 // Poll /api/state on load
 fetch('/api/state').then(r => r.json()).then(s => { state = s; renderAll(s); }).catch(() => {});

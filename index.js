@@ -11,6 +11,7 @@ const { startDashboard } = require('./dashboard/server');
 const { bootstrap }     = require('./core/db');
 const persistence       = require('./core/persistence');
 const geminiValidator   = require('./core/geminiValidator');
+const traderTracker     = require('./core/traderTracker');
 const {
   CryptoAgent,
   PoliticsAgent,
@@ -87,6 +88,11 @@ async function boot() {
       new WeatherAgent(),
       new OddsAgent()
     ];
+
+    // 4b. Init sharp trader tracking
+    logger.info('[Boot] Starting TraderTracker…');
+    await traderTracker.init();
+    traderTracker.start();
 
     // 5. Start agents staggered 3s apart
     logger.info('[Boot] Starting agents with 3s stagger…');
@@ -180,8 +186,9 @@ async function boot() {
     for (const agent of agents) {
       logger.info(`  ✓ ${agent.name.padEnd(18)} category=${agent.category.padEnd(10)} interval=${agent.intervalSeconds}s`);
     }
-    logger.info(`  Dashboard: http://localhost:${process.env.DASHBOARD_PORT || 3000}`);
-    logger.info(`  WebSocket: ws://localhost:${process.env.WS_PORT || 3001}`);
+    const dashPort = parseInt(process.env.PORT) || parseInt(process.env.HTTP_PORT) || 3000;
+    logger.info(`  Dashboard: http://localhost:${dashPort}`);
+    logger.info(`  WebSocket: ws://localhost:${dashPort}/ws`);
     logger.info(`  Mode:      ${stateStore.readOnly ? 'READ-ONLY (simulation)' : 'LIVE TRADING'}`);
     logger.info('══════════════════════════════════════════');
 

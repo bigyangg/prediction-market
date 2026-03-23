@@ -19,6 +19,7 @@ const newsFetcher = require('../core/newsFetcher');
 const polymarket  = require('../core/polymarketClient');
 const persistence       = require('../core/persistence');
 const geminiValidator   = require('../core/geminiValidator');
+const traderTracker     = require('../core/traderTracker');
 
 // ── Model config — read from env with exact fallbacks ─────────────────────────
 const SCOUT_MODEL = process.env.SCOUT_MODEL || 'claude-haiku-4-5-20251001';
@@ -344,13 +345,22 @@ Respond with ONLY this JSON, nothing else, no markdown:
       model: JUDGE_MODEL
     };
 
+    // Sharp trader signals — what on-chain whales are doing in this market
+    const sharpSignals = traderTracker.getSignalForMarket(
+      market.question,
+      market.conditionId || market.id
+    );
+    const sharpBlock = sharpSignals.length > 0
+      ? `\nSHARP TRADER ACTIVITY (on-chain data — weight heavily):\n${sharpSignals.slice(0, 5).join('\n')}\nNote: if multiple sharp traders are on the same side, increase confidence. If against proposed direction, reconsider.\n`
+      : '';
+
     const userPrompt = `MARKET: "${question}"
 CATEGORY: ${this.category}
 MARKET_PROBABILITY: ${marketProb}% (current YES price × 100)
 VOLUME_24H: $${parseFloat(market.volume24hr || market.volume || 0).toFixed(0)}
 LIQUIDITY: $${parseFloat(market.liquidity || 0).toFixed(0)}
 MARKET_ID: ${market.id || market.conditionId || 'unknown'}
-
+${sharpBlock}
 CONTEXT DATA:
 ${JSON.stringify(newsCtx, null, 2).slice(0, 1200)}
 
@@ -396,6 +406,18 @@ Analyze this market for mispricing. Output valid JSON only.`;
         confidence: decision.confidence, risk: decision.risk_level,
         latencyMs: elapsed, parseError: decision._parseError || false
       });
+
+      // Full judge output — visible to diagnose why trades are/aren't executing
+      logger.info(`Judge output`, {
+        agent:      this.name,
+        trade:      decision.trade,
+        edge:       decision.edge,
+        confidence: decision.confidence,
+        riskLevel:  decision.risk_level,
+        trueProb:   decision.true_probability,
+        reason:     decision.reason,
+        market:     question.slice(0, 55)
+      });
     } catch (err) {
       this._logClaudeError(err, 'Sonnet Judge', ctx);
       stateStore.addNews({ agent: this.name, text: `ERROR: Sonnet unavailable — ${question.slice(0, 50)}`, type: 'skip' });
@@ -427,9 +449,19 @@ Analyze this market for mispricing. Output valid JSON only.`;
     // Risk approval gate — ONLY path to execution (REQ-RSK-001)
     const approval = riskManager.approve(decision);
     if (!approval.approved) {
-      logger.info(`[${this.name}] Trade REJECTED by RiskManager`, {
-        ...ctx, reason: approval.reason, trade: decision.trade,
-        edge: decision.edge, confidence: decision.confidence
+      logger.info('Trade REJECTED', {
+        agent:       this.name,
+        reason:      approval.reason,
+        market:      market.question?.slice(0, 55),
+        trade:       decision.trade,
+        edge:        decision.edge,
+        confidence:  decision.confidence,
+        riskLevel:   decision.risk_level,
+        trueProb:    decision.true_probability,
+        marketProb:  decision.market_probability,
+        openTrades:  stateStore.openTradeCount,
+        dailyPnl:    stateStore.dailyPnl,
+        halted:      stateStore.engineHalted
       });
       return;
     }

@@ -5,26 +5,31 @@ const stateStore = require('./stateStore');
 
 class RiskManager {
   constructor() {
-    this.maxStake      = parseFloat(process.env.MAX_STAKE_USD)          || 20;
-    this.minStake      = parseFloat(process.env.MIN_STAKE_USD)           || 1;
-    this.dailyLossLimit= parseFloat(process.env.DAILY_LOSS_LIMIT_USD)   || 50;
-    this.maxOpenTrades = parseInt(process.env.MAX_OPEN_TRADES)           || 8;
-    this.minEdge       = parseFloat(process.env.MIN_EDGE_PCT)            || 5;
-    this.minConfidence = parseFloat(process.env.MIN_CONFIDENCE_PCT)      || 62;
+    this.maxStake       = parseFloat(process.env.MAX_STAKE_USD)        || 20;
+    this.minStake       = parseFloat(process.env.MIN_STAKE_USD)        || 1;
+    this.dailyLossLimit = parseFloat(process.env.DAILY_LOSS_LIMIT_USD) || 50;
+    this.maxOpenTrades  = parseInt(process.env.MAX_OPEN_TRADES)        || 8;
+    this.minEdge        = parseFloat(process.env.MIN_EDGE_PCT)         || 5;
+    this.minConfidence  = parseFloat(process.env.MIN_CONFIDENCE_PCT)   || 62;
+    this._modeLogged    = false;
+  }
+
+  // ── Simulation mode — relaxed thresholds when no real wallet ─────────────
+  get simulationMode() {
+    const pk = process.env.POLYMARKET_PRIVATE_KEY || '';
+    return !pk || pk === 'your_exported_private_key_here' || pk.startsWith('your_');
   }
 
   // ── Kelly Stake Sizing (SDD 4.1) ──────────────────────────────────────────
   calcStake(edge, confidence, riskLevel) {
-    const absEdge = Math.abs(edge);
-    const kellyFraction = (absEdge / 100) * (confidence / 100) * 0.25;
-    const basePot = this.maxStake * 10;
-    let rawStake = basePot * kellyFraction;
+    const absEdge        = Math.abs(edge);
+    const kellyFraction  = (absEdge / 100) * (confidence / 100) * 0.25;
+    const basePot        = this.maxStake * 10;
+    let rawStake         = basePot * kellyFraction;
 
-    // Risk level modifier
     const modifier = riskLevel === 'HIGH' ? 0.4 : riskLevel === 'MEDIUM' ? 0.7 : 1.0;
     rawStake *= modifier;
 
-    // Clamp to [minStake, maxStake]
     return Math.max(this.minStake, Math.min(this.maxStake, parseFloat(rawStake.toFixed(2))));
   }
 
@@ -32,6 +37,22 @@ class RiskManager {
   approve(decision) {
     const { trade, edge, confidence, risk_level } = decision;
     const absEdge = Math.abs(edge || 0);
+
+    // Relaxed thresholds in simulation mode
+    const minEdge = this.simulationMode ? 3  : this.minEdge;
+    const minConf = this.simulationMode ? 45 : this.minConfidence;
+
+    // Log mode on first call
+    if (!this._modeLogged) {
+      this._modeLogged = true;
+      logger.info('RiskManager mode', {
+        mode:          this.simulationMode ? 'SIMULATION (relaxed)' : 'LIVE (strict)',
+        minEdge,
+        minConf,
+        maxOpenTrades: this.maxOpenTrades,
+        dailyLossLimit: this.dailyLossLimit
+      });
+    }
 
     // Condition 1: Engine halted
     if (stateStore.engineHalted) {
@@ -56,18 +77,18 @@ class RiskManager {
     }
 
     // Condition 5: Minimum edge
-    if (absEdge < this.minEdge) {
-      return { approved: false, reason: `Edge ${absEdge.toFixed(1)}% below minimum ${this.minEdge}%` };
+    if (absEdge < minEdge) {
+      return { approved: false, reason: `Edge ${edge?.toFixed(1)}% < min ${minEdge}% (${this.simulationMode ? 'sim' : 'live'})` };
     }
 
     // Condition 6: Minimum confidence
-    if (confidence < this.minConfidence) {
-      return { approved: false, reason: `Confidence ${confidence}% below minimum ${this.minConfidence}%` };
+    if (confidence < minConf) {
+      return { approved: false, reason: `Confidence ${confidence}% < min ${minConf}% (${this.simulationMode ? 'sim' : 'live'})` };
     }
 
     // Condition 7: HIGH risk requires |edge| >= 10%
     if (risk_level === 'HIGH' && absEdge < 10) {
-      return { approved: false, reason: `HIGH risk trade requires |edge| >= 10% (got ${absEdge.toFixed(1)}%)` };
+      return { approved: false, reason: `HIGH risk needs edge >= 10%, got ${edge?.toFixed(1)}%` };
     }
 
     // All conditions passed — calculate stake
@@ -82,11 +103,15 @@ class RiskManager {
   // Stats for dashboard
   getStats() {
     return {
-      dailyPnl: stateStore.dailyPnl,
-      totalPnl: stateStore.totalPnl,
-      openTrades: stateStore.openTradeCount,
-      dailyLossLimit: this.dailyLossLimit,
-      dailyLossUsedPct: Math.min(100, Math.round((Math.abs(stateStore.dailyPnl) / this.dailyLossLimit) * 100))
+      dailyPnl:          stateStore.dailyPnl,
+      totalPnl:          stateStore.totalPnl,
+      openTrades:        stateStore.openTradeCount,
+      dailyLossLimit:    this.dailyLossLimit,
+      dailyLossUsedPct:  Math.min(100, Math.round((Math.abs(stateStore.dailyPnl) / this.dailyLossLimit) * 100)),
+      simulationMode:    this.simulationMode,
+      totalTrades:       stateStore.trades.length,
+      wins:              stateStore.winCount,
+      losses:            stateStore.lossCount
     };
   }
 }
