@@ -25,25 +25,38 @@ const traderTracker     = require('../core/traderTracker');
 const SCOUT_MODEL = process.env.SCOUT_MODEL || 'claude-haiku-4-5-20251001';
 const JUDGE_MODEL = process.env.JUDGE_MODEL || 'claude-sonnet-4-6';
 
-// ── Model 2 (Sonnet) system prompt — force raw JSON output ───────────────────
-const JUDGE_SYSTEM_PROMPT = `You are a quantitative prediction market trading engine.
-Analyze markets for mispricing between market probability and true probability.
+// ── Model 2 (Sonnet) system prompt — aggressive, decisive analyst ─────────────
+const JUDGE_SYSTEM_PROMPT = `You are an aggressive quantitative prediction market analyst.
+Your job is to find and act on mispricings. You should be DECISIVE.
 
-CRITICAL: You must respond with ONLY a single raw JSON object.
-- No markdown formatting
-- No code fences
-- No explanation text before or after
-- No newlines outside the JSON
-- Start your response with { and end with }
+Be DECISIVE. A SKIP is not safe — it means zero profit.
+Trade when edge >= 3% AND confidence >= 40%.
+Lean toward trading on borderline cases.
 
-TRADING RULES:
-- Only set trade to YES or NO if: |edge| >= 5%, confidence >= 62%, risk is LOW or MEDIUM
-- HIGH risk requires |edge| >= 10%
-- Otherwise set trade to SKIP
-- Be conservative. When uncertain → SKIP
+CRITICAL RULES:
+- Markets near 50% are the most interesting — high uncertainty = opportunity
+- Low probability markets (5-25%) with high volume often have edge
+- You MUST commit to a direction — SKIP only when you have genuinely no signal at all
+- False SKIPs cost as much as bad trades — do not default to SKIP
 
-REQUIRED JSON FORMAT (output this exact structure, nothing else):
-{"trade":"SKIP","true_probability":50,"confidence":60,"edge":0,"risk_level":"MEDIUM","time_sensitivity":"LOW","reason":"brief reason here","key_factor":"main signal","warning":"main risk"}`;
+CONFIDENCE SCORING (most markets should score 50-70, do NOT default to 30-40):
+- 70-85: strong signal, clear data, good liquidity
+- 55-69: reasonable signal, some uncertainty
+- 40-54: weak signal but a directional lean exists — still trade if edge >= 3%
+- Below 40: SKIP — genuinely no signal
+
+OUTPUT ONLY this exact JSON (no markdown, no explanation):
+{"trade":"YES"|"NO"|"SKIP","true_probability":N,"confidence":N,"edge":N,"risk_level":"LOW"|"MEDIUM"|"HIGH","time_sensitivity":"LOW"|"MEDIUM"|"HIGH","reason":"under 10 words","key_factor":"main signal","warning":"main risk"}
+
+WHEN TO TRADE:
+- YES: you believe true prob > market prob by 3%+
+- NO: you believe true prob < market prob by 3%+
+- SKIP: genuinely no signal whatsoever (use sparingly)
+
+RISK LEVELS:
+- LOW: clear signal, good liquidity, confident estimate
+- MEDIUM: reasonable signal, some uncertainty
+- HIGH: thin liquidity OR very speculative — avoid unless edge > 10%`;
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
@@ -364,27 +377,36 @@ ${sharpBlock}
 CONTEXT DATA:
 ${JSON.stringify(newsCtx, null, 2).slice(0, 1200)}
 
+Calibration: if market says 40% and you think 50%, edge=+10%. If market says 15% and you think 20%, edge=+5%. Be precise.
 Analyze this market for mispricing. Output valid JSON only.`;
 
     let decision;
     try {
       const t0  = Date.now();
       const msg = await this._client.messages.create({
-        model:      JUDGE_MODEL,
-        max_tokens: 500,
-        system:     JUDGE_SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: userPrompt }]
+        model:          JUDGE_MODEL,
+        max_tokens:     400,
+        system:         JUDGE_SYSTEM_PROMPT,
+        stop_sequences: ['\n\n', '```'],
+        messages:       [{ role: 'user', content: userPrompt }]
       });
       const elapsed = Date.now() - t0;
-      const rawText = msg.content[0].text;
-      logger.debug(`[${this.name}] Sonnet raw response`, { agent: this.name, raw: rawText.slice(0, 300) });
+      const rawText = msg.content.map(b => b.text || '').join('').trim();
+
+      // Log the FULL raw response on every call — diagnose parse failures
+      logger.warn('Claude raw response (first 500 chars)', {
+        raw:   rawText.slice(0, 500),
+        agent: this.name,
+        model: JUDGE_MODEL
+      });
 
       try {
         decision = extractJSON(rawText);
-      } catch {
-        logger.warn(`[${this.name}] Sonnet JSON parse FAILED — using safe SKIP`, {
-          ...ctx, raw: rawText.slice(0, 300),
-          hint: 'extractJSON could not find valid JSON in Sonnet response'
+      } catch (e) {
+        logger.warn('Sonnet JSON parse FAILED', {
+          raw:   rawText?.slice(0, 300),
+          error: e.message,
+          agent: this.name
         });
         decision = {
           trade:             'SKIP',
@@ -407,17 +429,29 @@ Analyze this market for mispricing. Output valid JSON only.`;
         latencyMs: elapsed, parseError: decision._parseError || false
       });
 
-      // Full judge output — visible to diagnose why trades are/aren't executing
-      logger.info(`Judge output`, {
-        agent:      this.name,
-        trade:      decision.trade,
-        edge:       decision.edge,
-        confidence: decision.confidence,
-        riskLevel:  decision.risk_level,
-        trueProb:   decision.true_probability,
-        reason:     decision.reason,
-        market:     question.slice(0, 55)
-      });
+      // Fix D — edge recalculation: if Claude said YES/NO but edge is near zero,
+      // recompute from the probabilities it returned (catches miscalculation)
+      if (decision.trade !== 'SKIP' && Math.abs(decision.edge || 0) < 1) {
+        const recalcEdge = (decision.true_probability || 0) - (decision.market_probability || marketProb);
+        if (Math.abs(recalcEdge) >= 2) {
+          logger.info('Edge recalculated from probabilities', {
+            original:     decision.edge,
+            recalculated: parseFloat(recalcEdge.toFixed(1))
+          });
+          decision.edge = parseFloat(recalcEdge.toFixed(1));
+        }
+      }
+
+      // ═══ JUDGE DECISION ═══ — full output for trade flow diagnosis
+      logger.info('═══ JUDGE DECISION ═══ ' + JSON.stringify({
+        TRADE:      decision.trade,
+        EDGE:       decision.edge,
+        CONFIDENCE: decision.confidence,
+        RISK:       decision.risk_level,
+        TRUE_PROB:  decision.true_probability,
+        MKT_PROB:   decision.market_probability || marketProb,
+        REASON:     decision.reason
+      }));
     } catch (err) {
       this._logClaudeError(err, 'Sonnet Judge', ctx);
       stateStore.addNews({ agent: this.name, text: `ERROR: Sonnet unavailable — ${question.slice(0, 50)}`, type: 'skip' });
@@ -448,6 +482,14 @@ Analyze this market for mispricing. Output valid JSON only.`;
 
     // Risk approval gate — ONLY path to execution (REQ-RSK-001)
     const approval = riskManager.approve(decision);
+
+    // ═══ APPROVAL RESULT ═══
+    logger.info('═══ APPROVAL RESULT ═══ ' + JSON.stringify({
+      approved: approval.approved,
+      REASON:   approval.reason || 'approved',
+      stake:    approval.stake
+    }));
+
     if (!approval.approved) {
       logger.info('Trade REJECTED', {
         agent:       this.name,

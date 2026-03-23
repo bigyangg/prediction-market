@@ -78,6 +78,31 @@ Confirm:
 - `/health` endpoint returns JSON
 - All agents start normally
 
+## Supabase RLS Setup
+
+Supabase enables Row Level Security (RLS) by default, which **blocks all writes** from the anon key unless you add policies. If Supabase tables exist but no data appears, RLS is the cause.
+
+**Option A — Disable RLS (easiest for a private bot):**
+
+Go to each table in **Supabase → Table Editor**, click the shield icon, click **Disable RLS**.
+Do this for all 5 tables: `trades`, `agent_decisions`, `market_cache`, `news_cache`, `daily_stats`
+
+**Option B — Add permissive policies (more secure):**
+
+Run this in **Supabase → SQL Editor**:
+
+```sql
+CREATE POLICY "allow_all" ON trades           FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all" ON agent_decisions  FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all" ON market_cache     FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all" ON news_cache       FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all" ON daily_stats      FOR ALL USING (true) WITH CHECK (true);
+```
+
+**Verification:** On boot, look for `Supabase write test: PASSED ✓`. If you see `FAILED`, RLS is blocking writes — apply Option A or B above.
+
+---
+
 ## Cost estimate (monthly)
 
 | Service    | Cost                              |

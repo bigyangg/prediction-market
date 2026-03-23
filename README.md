@@ -229,22 +229,26 @@ prediction-market/
 
 ## Recent Updates (v2.0)
 
-### 1. RiskManager Enhancements
-- **Simulation Mode**: Added `simulationMode` detector that automatically relaxes thresholds when no real private key is set (`minEdge` = 3%, `minConf` = 45%).
-- **Improved Logging**: Rejection messages now show exact values vs thresholds. The `baseAgent` logs a detailed Judge block after Sonnet decisions. `getStats()` outputs comprehensive trade details.
+### 1. RiskManager & Agent Enhancements
+- **Aggressive Judge System**: Sonnet judge prompt made more decisive. Default logic thresholds lowered (`edge` = 3%, `conf` = 40%) to safely capitalize on thinner margins. Fallback edge recalculation logic added.
+- **Simulation Mode**: Lowered thresholds further when no real private key is set (`minEdge` = 2%, `minConf` = 40%).
+- **Improved Logging**: Rejection messages now show exact values vs thresholds. Full agent raw responses and execution paths are now extensively logged.
 
 ### 2. Sharp Trader Tracking
-- **`traderTracker` Engine**: Fetches Polymarket's weekly leaderboard and dynamically tracks actions from top traders.
+- **`traderTracker` Engine**: Fetches Polymarket's weekly leaderboard dynamically via the profit API to track movements of top traders.
 - **Signal Generation**: Compiles the last 48h trades + current holdings (≥10 shares) and injects a "SHARP TRADER ACTIVITY" block into the Sonnet prompt for edge discovery.
-- **Dashboard UI**: New Sharp Traders panel included on the dashboard with capabilities to manually add traders and auto-refresh feed visuals.
+- **Dashboard UI**: New Sharp Traders panel included on the dashboard to manually add traders and auto-refresh visual feeds.
 
-### 3. GNews Cache Fix
-- Supabase news cache TTL increased from 5 to 30 minutes to efficiently protect the 100/day GNews API budget.
+### 3. Reliability & Persistence
+- **Supabase Integrity**: Added robust boot-time write tests to proactively detect Row Level Security (RLS) connection blocks. Detailed fix included in `DEPLOY.md`.
+- **Engine Watchdog**: Dedicated background process automatically restarts the engine if it enters an invalid stopped state due to API disconnects.
+- **Dashboard Controls**: Pressing Start on the UI now successfully clears daily loss limit halts for seamless user overrides.
+- **GNews Cache Fix**: Supabase news cache TTL increased from 5 to 30 minutes to efficiently protect the 100/day GNews API budget.
 
 ### 4. Cloud Deployment Architecture
 - **Railway Configuration**: Full `railway.json` and `.railwayignore` added. See `DEPLOY.md` for a comprehensive step-by-step deploy guide.
 - **Single Port System**: HTTP dashboard and WebSocket now seamlessly share a single port (Dashboard on `/`, WebSocket on `/ws`).
-- **Healthchecks**: Added `/health` endpoint and adjusted logging for cloud environments.
+- **Healthchecks**: Added `/health` endpoint and adjusted logging specifically for cloud container environments.
 
 ---
 

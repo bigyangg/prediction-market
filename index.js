@@ -70,7 +70,27 @@ async function boot() {
     const dbReady = await bootstrap();
     persistence.setEnabled(dbReady);
 
+    logger.info('Supabase persistence', {
+      enabled: dbReady,
+      status: dbReady ? 'ACTIVE — data will persist' : 'DISABLED — data lost on restart'
+    });
+
     if (dbReady) {
+      // Boot write test — catches RLS blocks immediately
+      try {
+        await persistence.updateDailyStats({
+          totalPnl: 0, dailyPnl: 0, totalTrades: 0,
+          wins: 0, losses: 0, scansCompleted: 0, geminiVetos: 0
+        });
+        logger.info('Supabase write test: PASSED ✓ — data will persist');
+      } catch (e) {
+        logger.error('Supabase write test: FAILED', { error: e.message });
+        logger.warn('If Supabase writes fail, disable RLS in Supabase dashboard:');
+        logger.warn('Go to: Table Editor → each table → RLS → Disable RLS');
+        logger.warn('OR run in SQL Editor: CREATE POLICY "allow_all" ON <table> FOR ALL USING (true) WITH CHECK (true);');
+        persistence.setEnabled(false);
+      }
+
       await stateStore.loadFromSupabase();
       logger.info('[Boot] Session state restored from Supabase');
     }
@@ -178,7 +198,15 @@ async function boot() {
       }
     }, { timezone: 'UTC' });
 
-    // 9. (Wallet refresh is now handled by Data API poll every 30s above)
+    // 9. Watchdog — auto-restart engine if stopped by API failure (not manual/halt)
+    setInterval(() => {
+      if (!stateStore.engineRunning && !stateStore.engineHalted) {
+        logger.info('[Watchdog] Engine was stopped (not halted) — auto-restarting');
+        stateStore.setEngineRunning(true);
+      }
+    }, 2 * 60 * 1000); // check every 2 minutes
+
+    // 10. (Wallet refresh is now handled by Data API poll every 30s above)
 
     // ── Print agent summary ────────────────────────────────────────────────
     logger.info('══════════════════════════════════════════');

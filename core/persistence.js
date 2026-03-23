@@ -34,10 +34,14 @@ async function saveTrade(trade) {
       opened_at:        trade.openedAt || trade.ts,
       order_id:         trade.orderId
     });
-    if (error) logger.debug('saveTrade error', { error: error.message });
-    return !error;
+    if (error) {
+      logger.error('saveTrade FAILED', { error: error.message, code: error.code, tradeId: trade.id });
+      return false;
+    }
+    logger.debug('saveTrade OK', { tradeId: trade.id });
+    return true;
   } catch (e) {
-    logger.debug('saveTrade exception', { error: e.message });
+    logger.error('saveTrade exception', { error: e.message, tradeId: trade.id });
     return null;
   }
 }
@@ -100,9 +104,13 @@ async function saveDecision(decision) {
       final_action:       decision.finalAction,
       rejection_reason:   decision.rejectionReason
     });
-    if (error) logger.debug('saveDecision error', { error: error.message });
+    if (error) {
+      logger.error('saveDecision FAILED', { error: error.message, code: error.code });
+    } else {
+      logger.debug('saveDecision OK');
+    }
   } catch (e) {
-    logger.debug('saveDecision exception', { error: e.message });
+    logger.error('saveDecision exception', { error: e.message });
   }
 }
 
@@ -165,8 +173,11 @@ async function cacheMarkets(markets) {
     }));
 
     const { error } = await supabase.from('market_cache').upsert(rows, { onConflict: 'id' });
-    if (error) logger.debug('cacheMarkets error', { error: error.message });
-    else logger.debug('Market cache updated', { count: rows.length });
+    if (error) {
+      logger.error('cacheMarkets FAILED', { error: error.message, code: error.code });
+    } else {
+      logger.info('Market cache updated in Supabase', { count: rows.length });
+    }
   } catch (e) {
     logger.debug('cacheMarkets exception', { error: e.message });
   }
@@ -189,9 +200,11 @@ async function updateDailyStats(stats) {
       gemini_vetos:    stats.geminiVetos || 0,
       updated_at:      new Date().toISOString()
     }, { onConflict: 'date' });
-    if (error) logger.debug('updateDailyStats error', { error: error.message });
+    if (error) {
+      logger.error('updateDailyStats FAILED', { error: error.message, code: error.code });
+    }
   } catch (e) {
-    logger.debug('updateDailyStats exception', { error: e.message });
+    logger.error('updateDailyStats exception', { error: e.message });
   }
 }
 

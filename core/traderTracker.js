@@ -9,8 +9,13 @@ const DATA_API = 'https://data-api.polymarket.com';
 // These are PUBLIC addresses visible on polymarket.com/leaderboard
 // Add more via POST /api/traders/add or they are auto-discovered from leaderboard
 const SHARP_WALLETS = [
-  // { address, alias, description }
-  // Start empty — auto-discovery fills this from the leaderboard API
+  // Placeholder — replaced by leaderboard auto-discovery on boot
+  // Add real wallets via POST /api/traders/add or wait for leaderboard fetch
+  {
+    address:     '0x0000000000000000000000000000000000000000',
+    alias:       'Placeholder — leaderboard loading',
+    description: 'Will be replaced by auto-discovery'
+  }
 ];
 
 class TraderTracker {
@@ -40,8 +45,8 @@ class TraderTracker {
 
   async fetchLeaderboard() {
     try {
-      const res = await axios.get(`${DATA_API}/leaderboard`, {
-        params:  { limit: 20, window: '1w' },
+      const res = await axios.get(`${DATA_API}/leaderboard/profit`, {
+        params:  { window: 'weekly', limit: 20 },
         timeout: 10000
       });
 
@@ -49,13 +54,14 @@ class TraderTracker {
       this.leaderboard = traders.map(t => ({
         address: t.proxyWallet || t.address,
         alias:   t.name || t.pseudonym || 'Trader',
-        pnl:     t.pnlUsd     || 0,
-        volume:  t.volume     || 0,
+        pnl:     t.profit      || 0,
+        volume:  t.volume      || 0,
         trades:  t.tradesCount || 0,
         winRate: t.percentPnl  || 0
       })).filter(t => t.address);
 
-      // Auto-add top 5 to watch list if not already present
+      // Auto-add top 5 to watch list — replace placeholder if still present
+      this.wallets = this.wallets.filter(w => !w.address.includes('000000'));
       for (const trader of this.leaderboard.slice(0, 5)) {
         if (!this.wallets.find(w => w.address === trader.address)) {
           this.wallets.push({
@@ -71,14 +77,18 @@ class TraderTracker {
         watching:   this.wallets.length
       });
     } catch (e) {
-      logger.warn('TraderTracker: fetchLeaderboard failed', { error: e.message });
+      logger.warn('TraderTracker: leaderboard unavailable — will retry in 5 min');
+      logger.warn('Add wallet addresses manually via dashboard to start tracking');
     }
   }
 
   // ── Position + trade fetch ─────────────────────────────────────────────────
 
   async fetchAllPositions() {
-    if (this.wallets.length === 0) return;
+    if (this.wallets.length === 0 || this.wallets.every(w => w.address.includes('000000'))) {
+      logger.info('TraderTracker: no real wallets yet — skipping position fetch');
+      return;
+    }
 
     for (const wallet of this.wallets) {
       try {

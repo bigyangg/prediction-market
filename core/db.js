@@ -21,8 +21,16 @@ async function bootstrap() {
     return false;
   }
 
+  logger.info('Supabase config check', {
+    url: process.env.SUPABASE_URL ? process.env.SUPABASE_URL.slice(0, 30) + '...' : 'MISSING',
+    key: process.env.SUPABASE_ANON_KEY ? process.env.SUPABASE_ANON_KEY.slice(0, 20) + '...' : 'MISSING'
+  });
+
   try {
-    const { error } = await supabase.from('trades').select('id').limit(1);
+    const { data, error } = await supabase
+      .from('trades')
+      .select('count')
+      .limit(1);
 
     if (error && error.code === '42P01') {
       // Tables don't exist — log SQL for user to run
@@ -127,11 +135,15 @@ ALTER PUBLICATION supabase_realtime ADD TABLE daily_stats;
     }
 
     if (error) {
-      logger.warn('Supabase connection failed — running without persistence', { error: error.message });
+      logger.error('Supabase connection test FAILED', {
+        code:    error.code,
+        message: error.message,
+        hint:    error.hint
+      });
       return false;
     }
 
-    logger.info('Supabase: connected and tables verified');
+    logger.info('Supabase connection test PASSED ✓ — tables verified');
     return true;
 
   } catch (e) {

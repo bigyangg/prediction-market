@@ -54,8 +54,10 @@ app.post('/api/engine/stop', (_req, res) => {
 // POST /api/engine/start
 app.post('/api/engine/start', (_req, res) => {
   if (stateStore.engineHalted) {
-    // Don't auto-resume if halted by loss limit — use reset-daily first
-    return res.status(400).json({ ok: false, error: 'Engine halted by daily loss limit. Reset daily P&L first.' });
+    // Halted by daily loss limit — resume clears the halt flag and restarts
+    stateStore.resumeEngine();
+    logger.info('Dashboard: Engine resumed from halt by user (daily loss limit override)');
+    return res.json({ ok: true, engineRunning: true, note: 'resumed from halt' });
   }
   stateStore.setEngineRunning(true);
   logger.info('Dashboard: Engine started by user');

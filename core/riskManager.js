@@ -39,8 +39,8 @@ class RiskManager {
     const absEdge = Math.abs(edge || 0);
 
     // Relaxed thresholds in simulation mode
-    const minEdge = this.simulationMode ? 3  : this.minEdge;
-    const minConf = this.simulationMode ? 45 : this.minConfidence;
+    const minEdge = this.simulationMode ? 2  : this.minEdge;
+    const minConf = this.simulationMode ? 40 : this.minConfidence;
 
     // Log mode on first call
     if (!this._modeLogged) {
@@ -67,8 +67,9 @@ class RiskManager {
     }
 
     // Condition 3: Open trade count
-    if (stateStore.openTradeCount >= this.maxOpenTrades) {
-      return { approved: false, reason: `Max open trades reached (${this.maxOpenTrades})` };
+    const openCount = stateStore.openTradeCount;
+    if (openCount >= this.maxOpenTrades) {
+      return { approved: false, reason: `Max ${this.maxOpenTrades} open trades reached (${openCount} open)` };
     }
 
     // Condition 4: SKIP decision
