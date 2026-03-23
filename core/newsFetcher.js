@@ -510,6 +510,15 @@ class NewsFetcher {
     const ctx = {};
     const fn  = `getContextForCategory(${category})`;
 
+    // Supabase news cache — serves same context for 5 min to protect GNews budget
+    const persistence = require('./persistence');
+    const cacheKey = 'news_' + category;
+    const supabaseCached = await persistence.getCachedNews(cacheKey, 5);
+    if (supabaseCached) {
+      logger.debug(`[NewsFetcher.${fn}] Serving from Supabase cache`);
+      return supabaseCached;
+    }
+
     try {
       switch (category) {
 
@@ -621,6 +630,9 @@ class NewsFetcher {
       sources: sizes,
       tf:      this.getTFStatus().state
     });
+
+    // Cache to Supabase for 5-min reuse across restarts
+    persistence.setCachedNews(cacheKey, category, 'multi', ctx).catch(() => {});
 
     return ctx;
   }

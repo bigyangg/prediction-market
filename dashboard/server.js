@@ -7,7 +7,8 @@ const { WebSocketServer } = require('ws');
 const logger      = require('../core/logger');
 const stateStore  = require('../core/stateStore');
 const riskManager = require('../core/riskManager');
-const newsFetcher = require('../core/newsFetcher');
+const newsFetcher     = require('../core/newsFetcher');
+const geminiValidator = require('../core/geminiValidator');
 
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT) || 3000;
 const WS_PORT        = parseInt(process.env.WS_PORT)        || 3001;
@@ -24,9 +25,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/api/state', (_req, res) => {
   res.json({
     ...stateStore.snapshot(),
-    riskStats:    riskManager.getStats(),
-    gnewsBudget:  newsFetcher.getBudgetStatus(),
-    tfStatus:     newsFetcher.getTFStatus()
+    riskStats:      riskManager.getStats(),
+    gnewsBudget:    newsFetcher.getBudgetStatus(),
+    tfStatus:       newsFetcher.getTFStatus(),
+    geminiStats:    geminiValidator.getStats()
   });
 });
 
@@ -56,6 +58,14 @@ app.post('/api/risk/reset-daily', (_req, res) => {
     logger.info('Dashboard: Daily P&L reset and engine resumed');
   }
   res.json({ ok: true, dailyPnl: 0 });
+});
+
+// GET /api/config — safely expose public keys for dashboard Supabase realtime
+app.get('/api/config', (_req, res) => {
+  res.json({
+    supabaseUrl: process.env.SUPABASE_URL  || '',
+    supabaseKey: process.env.SUPABASE_ANON_KEY || ''
+  });
 });
 
 // POST /api/trade/manual — manual trade override via event

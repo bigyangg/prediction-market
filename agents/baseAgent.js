@@ -17,6 +17,8 @@ const stateStore  = require('../core/stateStore');
 const riskManager = require('../core/riskManager');
 const newsFetcher = require('../core/newsFetcher');
 const polymarket  = require('../core/polymarketClient');
+const persistence       = require('../core/persistence');
+const geminiValidator   = require('../core/geminiValidator');
 
 // ── Model config — read from env with exact fallbacks ─────────────────────────
 const SCOUT_MODEL = process.env.SCOUT_MODEL || 'claude-haiku-4-5-20251001';
@@ -204,6 +206,17 @@ class BaseAgent {
 
       const market = markets[i];
       const worthAnalyzing = await this.scoutMarket(market, scanId);
+
+      // Save every scout decision to Supabase for intelligence analysis
+      persistence.saveDecision({
+        agent:         this.name,
+        marketId:      market.id,
+        question:      market.question,
+        category:      market.category,
+        scoutVerdict:  worthAnalyzing ? 'PASS' : 'SKIP',
+        finalAction:   worthAnalyzing ? 'pending' : 'scout_skip'
+      }).catch(() => {});
+
       if (worthAnalyzing) approved.push(market);
     }
 
@@ -395,6 +408,22 @@ Analyze this market for mispricing. Output valid JSON only.`;
       type:  decision.trade === 'SKIP' ? 'skip' : 'signal'
     });
 
+    // Save judge decision to Supabase before approval check
+    persistence.saveDecision({
+      agent:             this.name,
+      marketId:          market.id,
+      question:          market.question,
+      category:          market.category,
+      scoutVerdict:      'PASS',
+      claudeTrade:       decision.trade,
+      claudeEdge:        decision.edge,
+      claudeConfidence:  decision.confidence,
+      claudeTrueProb:    decision.true_probability,
+      claudeRisk:        decision.risk_level,
+      claudeReason:      decision.reason,
+      finalAction:       'pending'
+    }).catch(() => {});
+
     // Risk approval gate — ONLY path to execution (REQ-RSK-001)
     const approval = riskManager.approve(decision);
     if (!approval.approved) {
@@ -403,6 +432,48 @@ Analyze this market for mispricing. Output valid JSON only.`;
         edge: decision.edge, confidence: decision.confidence
       });
       return;
+    }
+
+    // Gemini validation — live web search + independent check
+    const validation = await geminiValidator.validate(market, {
+      ...decision,
+      market_probability: market.marketProb ?? this._getMarketProbability(market)
+    });
+
+    if (validation.verdict === 'VETO') {
+      logger.warn(`[${this.name}] Trade VETOED by Gemini`, {
+        ...ctx, reason: validation.reason, concern: validation.key_concern,
+        confidence: validation.confidence, searchUsed: validation.search_used
+      });
+      stateStore.addNews({
+        agent: this.name,
+        text:  `VETOED by Gemini: ${validation.reason} — ${question.slice(0, 50)}`,
+        type:  'skip'
+      });
+      // Persist veto decision
+      persistence.saveDecision({
+        agent:           this.name,
+        marketId:        market.id,
+        question:        market.question,
+        category:        market.category,
+        scoutVerdict:    'PASS',
+        claudeTrade:     decision.trade,
+        claudeEdge:      decision.edge,
+        claudeConfidence: decision.confidence,
+        geminiVerdict:   'VETO',
+        geminiConfidence: validation.confidence,
+        geminiReason:    validation.reason,
+        finalAction:     'gemini_veto',
+        rejectionReason: validation.key_concern
+      }).catch(() => {});
+      return;
+    }
+
+    // Gemini confirmed — proceed
+    if (!validation._skipped && !validation._error) {
+      logger.info(`[${this.name}] Trade CONFIRMED by Gemini`, {
+        reason: validation.reason, searchUsed: validation.search_used
+      });
     }
 
     await this.executeTrade(market, decision, approval.stake, scanId);
@@ -444,6 +515,7 @@ Analyze this market for mispricing. Output valid JSON only.`;
       trade.orderId   = result.orderId || result.order_id || tradeId;
       trade.simulated = result.simulated || false;
       stateStore.recordTrade(trade);
+      persistence.saveTrade(trade).catch(() => {});
 
       logger.info(`[${this.name}] Trade OPEN`, {
         ...ctx, orderId: trade.orderId,
@@ -453,6 +525,7 @@ Analyze this market for mispricing. Output valid JSON only.`;
       trade.status = 'failed';
       trade.error  = err.message;
       stateStore.recordTrade(trade);
+      persistence.saveTrade(trade).catch(() => {});
       logger.error(`[${this.name}] Trade FAILED`, {
         ...ctx, error: err.message,
         hint: 'Order not placed — see PolymarketClient logs for details'

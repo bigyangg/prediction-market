@@ -1,5 +1,6 @@
 'use strict';
 const { EventEmitter } = require('events');
+const logger = require('./logger');
 
 class StateStore extends EventEmitter {
   constructor() {
@@ -167,6 +168,54 @@ class StateStore extends EventEmitter {
   get winRate() {
     const total = this.winCount + this.lossCount;
     return total === 0 ? 0 : Math.round((this.winCount / total) * 100);
+  }
+
+  // ── Restore from Supabase on boot ─────────────────────────────────────────
+
+  async loadFromSupabase() {
+    const persistence = require('./persistence');
+    try {
+      const trades = await persistence.loadRecentTrades(100);
+      if (trades.length > 0) {
+        this.trades = trades.map(t => ({
+          id:         t.id,
+          agent:      t.agent,
+          category:   t.category,
+          question:   t.question,
+          market:     t.question,      // stateStore/dashboard reads .market
+          trade:      t.trade,
+          side:       t.trade,         // dashboard reads .side
+          stake:      t.stake,
+          edge:       t.edge,
+          confidence: t.confidence,
+          marketProb: t.market_prob,
+          trueProb:   t.true_prob,
+          riskLevel:  t.risk_level,
+          reason:     t.reason,
+          status:     t.status,
+          geminiValidated: t.gemini_validated,
+          pnl:        t.pnl,
+          openedAt:   t.opened_at,
+          ts:         t.opened_at,
+          orderId:    t.order_id
+        }));
+        logger.info('StateStore: loaded from Supabase', { trades: trades.length });
+      }
+
+      const stats = await persistence.getDailyStats(1);
+      if (stats[0]) {
+        // Restore today's counters directly on stateStore (riskManager reads these)
+        this.dailyPnl  = parseFloat(stats[0].daily_pnl)      || 0;
+        this.winCount  = parseInt(stats[0].winning_trades)    || 0;
+        this.lossCount = parseInt(stats[0].losing_trades)     || 0;
+        logger.info('RiskManager: restored daily stats from Supabase', {
+          dailyPnl:    this.dailyPnl,
+          totalTrades: parseInt(stats[0].total_trades) || 0
+        });
+      }
+    } catch (e) {
+      logger.warn('loadFromSupabase failed', { error: e.message });
+    }
   }
 
   // ── Snapshot for dashboard ─────────────────────────────────────────────────

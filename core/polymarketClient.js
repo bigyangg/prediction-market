@@ -1,7 +1,7 @@
 'use strict';
 require('dotenv').config();
 const { ClobClient, Side, OrderType } = require('@polymarket/clob-client');
-const { Wallet, ethers }              = require('ethers'); // v5
+const { Wallet }                      = require('ethers'); // v5 — Wallet only, no RPC
 const axios                           = require('axios');
 const WebSocket                       = require('ws');
 const logger                          = require('./logger');
@@ -13,22 +13,6 @@ const USER_WS_URL   = 'wss://ws-subscriptions-clob.polymarket.com/ws/user';
 const GEOBLOCK_URL  = 'https://polymarket.com/api/geoblock';
 const CLOB_HOST     = process.env.CLOB_API_URL  || 'https://clob.polymarket.com';
 const CHAIN_ID      = 137; // Polygon mainnet
-
-// USDC on Polygon (fallback balance check)
-const USDC_ADDRESS = process.env.USDC_CONTRACT || '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-const USDC_ABI     = [
-  'function balanceOf(address owner) view returns (uint256)'
-];
-
-// Multiple public Polygon RPC endpoints — tried in order
-const POLYGON_RPCS = [
-  process.env.POLYGON_RPC_URL,
-  'https://polygon-rpc.com',
-  'https://rpc-mainnet.matic.network',
-  'https://rpc-mainnet.maticvigil.com',
-  'https://polygon.llamarpc.com',
-  'https://rpc.ankr.com/polygon'
-].filter(Boolean);
 
 // ── Market normalizer ────────────────────────────────────────────────────────
 function mapMarket(m) {
@@ -253,46 +237,15 @@ class PolymarketClient {
   // ── USDC Balance ──────────────────────────────────────────────────────────
 
   async getUSDCBalance() {
-    // In read-only mode with no wallet — return 0 cleanly
-    if (this.readOnly || !this.funder) return '0.00';
-
-    // Primary: clob-client (no RPC needed)
-    if (this.client) {
-      try {
-        const data    = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
-        const balance = data?.balance ?? data?.allowance ?? null;
-        if (balance !== null) return parseFloat(balance).toFixed(2);
-      } catch (err) {
-        logger.debug('[PolymarketClient.getUSDCBalance] CLOB balance failed — trying RPC', {
-          error: err.message
-        });
-      }
+    if (this.readOnly || !this.client) return '0.00';
+    try {
+      // Use CLOB API balance endpoint — no RPC needed
+      const bal = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+      return parseFloat(bal?.balance || 0).toFixed(2);
+    } catch (e) {
+      logger.debug('getUSDCBalance failed', { error: e.message });
+      return '0.00';
     }
-
-    // Fallback: try each Polygon RPC endpoint in turn
-    const addr = this.funder || this.wallet?.address;
-    if (!addr) return '0.00';
-
-    for (const rpc of POLYGON_RPCS) {
-      try {
-        const provider = new ethers.providers.JsonRpcProvider(rpc);
-        provider.pollingInterval = 4000;
-        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
-        const raw  = await Promise.race([
-          usdc.balanceOf(addr),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
-        ]);
-        const balance = parseFloat(ethers.utils.formatUnits(raw, 6)).toFixed(2);
-        logger.debug('[PolymarketClient.getUSDCBalance] USDC balance via RPC', { rpc, balance });
-        return balance;
-      } catch (err) {
-        logger.debug('[PolymarketClient.getUSDCBalance] RPC failed', { rpc, error: err.message });
-      }
-    }
-
-    // All RPCs failed — return 0 silently
-    logger.debug('[PolymarketClient.getUSDCBalance] all RPCs failed — returning 0');
-    return '0.00';
   }
 
   async refreshWallet() {
@@ -415,6 +368,15 @@ class PolymarketClient {
   // ── Gamma API — Active Markets ────────────────────────────────────────────
 
   async getActiveMarkets({ limit = 50 } = {}) {
+    const persistence = require('./persistence');
+    const ttl = parseInt(process.env.MARKET_CACHE_TTL_MINUTES) || 10;
+
+    const cached = await persistence.getCachedMarkets(ttl);
+    if (cached && cached.length > 0) {
+      logger.info('getActiveMarkets: serving from Supabase cache', { count: cached.length });
+      return cached;
+    }
+
     try {
       const res = await axios.get('https://gamma-api.polymarket.com/markets', {
         params: { active: true, closed: false, limit: 100, order: 'volume24hr', ascending: false },
@@ -426,7 +388,11 @@ class PolymarketClient {
       logger.info('Gamma API response', { count: raw.length, first: raw[0]?.question?.slice(0, 50) });
 
       const markets = raw.map(m => mapMarket(m)).filter(Boolean);
-      return filterAndReturn(markets, limit);
+      const filtered = filterAndReturn(markets, limit);
+
+      // Cache results to Supabase for next restart
+      persistence.cacheMarkets(filtered).catch(() => {});
+      return filtered;
     } catch (err) {
       logger.error('getActiveMarkets failed', {
         status:       err.response?.status,

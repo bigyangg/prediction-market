@@ -8,6 +8,9 @@ const riskManager = require('./core/riskManager');
 const polymarket  = require('./core/polymarketClient');
 const newsFetcher = require('./core/newsFetcher');
 const { startDashboard } = require('./dashboard/server');
+const { bootstrap }     = require('./core/db');
+const persistence       = require('./core/persistence');
+const geminiValidator   = require('./core/geminiValidator');
 const {
   CryptoAgent,
   PoliticsAgent,
@@ -58,11 +61,24 @@ async function boot() {
       logger.info(`[Boot] Funder: ${funderAddr} | Balance: $${initBal} USDC`);
     }
 
-    // 2. Start dashboard
+    // 2. Init Gemini validator
+    geminiValidator.init();
+
+    // 2b. Connect to Supabase
+    logger.info('[Boot] Connecting to Supabase…');
+    const dbReady = await bootstrap();
+    persistence.setEnabled(dbReady);
+
+    if (dbReady) {
+      await stateStore.loadFromSupabase();
+      logger.info('[Boot] Session state restored from Supabase');
+    }
+
+    // 3. Start dashboard
     logger.info('[Boot] Starting dashboard…');
     await startDashboard();
 
-    // 3. Instantiate all 6 agents
+    // 4. Instantiate all 6 agents
     const agents = [
       new CryptoAgent(),
       new PoliticsAgent(),
@@ -72,7 +88,7 @@ async function boot() {
       new OddsAgent()
     ];
 
-    // 4. Start agents staggered 3s apart
+    // 5. Start agents staggered 3s apart
     logger.info('[Boot] Starting agents with 3s stagger…');
     for (let i = 0; i < agents.length; i++) {
       const agent = agents[i];
@@ -81,7 +97,7 @@ async function boot() {
       logger.info(`[Boot] Agent queued: ${agent.name} (starts in ${staggerMs / 1000}s)`);
     }
 
-    // 5. Manual trade handler
+    // 6. Manual trade handler
     stateStore.on('manual_trade', async (payload) => {
       logger.info(`[Manual] Processing manual trade: "${payload.question}"`);
       // Route to OddsAgent (general purpose) for manual analysis
@@ -102,7 +118,7 @@ async function boot() {
       }
     });
 
-    // 5b. Data API polling — real on-chain positions/trades/PnL every 30s
+    // 6b. Data API polling — real on-chain positions/trades/PnL every 30s
     const pollDataAPI = async () => {
       try {
         const [pnlData, trades] = await Promise.all([
@@ -131,7 +147,21 @@ async function boot() {
       pollDataAPI();
     });
 
-    // 6. Midnight UTC cron — reset daily P&L
+    // 7. Daily stats sync to Supabase every 60s
+    setInterval(() => {
+      const stats = riskManager.getStats();
+      persistence.updateDailyStats({
+        totalPnl:       stats.totalPnl,
+        dailyPnl:       stats.dailyPnl,
+        totalTrades:    stateStore.trades.length,
+        wins:           stateStore.winCount,
+        losses:         stateStore.lossCount,
+        scansCompleted: stateStore.scansCompleted,
+        geminiVetos:    0
+      }).catch(() => {});
+    }, 60000);
+
+    // 8. Midnight UTC cron — reset daily P&L
     cron.schedule('0 0 * * *', () => {
       logger.info('[Cron] Midnight UTC — resetting daily P&L');
       stateStore.resetDailyPnl();
@@ -142,7 +172,7 @@ async function boot() {
       }
     }, { timezone: 'UTC' });
 
-    // 7. (Wallet refresh is now handled by Data API poll every 30s above)
+    // 9. (Wallet refresh is now handled by Data API poll every 30s above)
 
     // ── Print agent summary ────────────────────────────────────────────────
     logger.info('══════════════════════════════════════════');
