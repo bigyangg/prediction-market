@@ -50,6 +50,10 @@ function mapMarket(m) {
     marketProb:      Math.round(lastPrice * 100),
     tokens,
     tokenIds,
+    // Pre-parsed arrays — downstream code can use these directly without JSON.parse
+    clobTokenIds:    tokenIds,
+    outcomePrices:   prices,
+    outcomes,
     active:          m.active !== false,
     closed:          m.closed === true,
     acceptingOrders: m.acceptingOrders !== false,
@@ -187,17 +191,34 @@ class PolymarketClient {
       return;
     }
 
-    // Step 3 — Derive API credentials (L1 client, no creds yet)
+    // Step 3 — Create single client (Python: ClobClient(key, chain_id, sig_type, funder))
+    // funderAddress is CRITICAL for POLY_PROXY — without it the CLOB looks up keys
+    // for the signing address (0x2C76d...) instead of the funder (0x2045...)
+    const client = new this.ClobClient(
+      this.host,
+      this.chainId,
+      this.wallet,
+      undefined,               // no creds yet
+      this.sigType,            // 1 = POLY_PROXY
+      this.funder || undefined
+    );
+
+    // Step 4 — Derive creds then create L2 client with { key } field
+    // JS SDK constructor expects "key" not "apiKey" — confirmed via test-auth.js
+    let creds;
     try {
-      const l1client = new this.ClobClient(this.host, this.chainId, this.wallet);
-      this.apiCreds  = await l1client.createOrDeriveApiKey();
-      logger.info('[PolymarketClient.init] API credentials derived', {
-        address: this._truncate(this.wallet.address)
-      });
-      // Log creds clearly for debugging (operator can copy these)
-      logger.info('POLY_API_KEY=' + this.apiCreds.apiKey);
-      logger.info('POLY_SECRET='  + this.apiCreds.secret);
-      logger.info('POLY_PASSPHRASE=' + this.apiCreds.passphrase);
+      try {
+        creds = await client.deriveApiKey(0);
+        logger.info('[PolymarketClient.init] deriveApiKey success', {
+          key: creds.key ? creds.key.slice(0, 8) + '...' : 'MISSING'
+        });
+      } catch (e) {
+        logger.warn('[PolymarketClient.init] derive failed, creating new key', { error: e.message });
+        creds = await client.createApiKey(0);
+        logger.info('[PolymarketClient.init] createApiKey success', {
+          key: creds.key ? creds.key.slice(0, 8) + '...' : 'MISSING'
+        });
+      }
     } catch (err) {
       apiError('init.deriveApiKey', err, { address: this._truncate(this.wallet?.address) });
       stateStore.readOnly = true;
@@ -205,40 +226,44 @@ class PolymarketClient {
       return;
     }
 
-    // Step 4 — Create authenticated L2 client
+    const l2client = new this.ClobClient(
+      this.host,
+      this.chainId,
+      this.wallet,
+      { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
+      this.sigType,
+      this.funder || undefined
+    );
+
+    this.client   = l2client;
+    this.readOnly = false;
+    stateStore.readOnly = false;
+
+    // Store for WebSocket auth (WS uses apiKey field name)
+    this.apiCreds = {
+      apiKey:     creds.key,
+      secret:     creds.secret,
+      passphrase: creds.passphrase
+    };
+
+    logger.info('[PolymarketClient.init] L2 client ready', {
+      key: creds.key ? creds.key.slice(0, 8) + '...' : 'MISSING'
+    });
+
+    // Step 5 — Verify auth with balance check
     try {
-      this.client = new this.ClobClient(
-        this.host,
-        this.chainId,
-        this.wallet,
-        this.apiCreds,
-        this.sigType,
-        this.funder || undefined
-      );
-      this.readOnly = false;
-      stateStore.readOnly = false;
-      logger.info('[PolymarketClient.init] Authenticated L2 client ready', {
-        sigType: this.sigType,
-        funder:  this._truncate(this.funder)
-      });
+      const bal     = await l2client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+      const balance = (parseInt(bal?.balance || 0) / 1e6).toFixed(2);
+      logger.info(`[PolymarketClient.init] Auth verified — USDC balance: $${balance}`);
+      stateStore.setWallet(this.funder || this.wallet.address, parseFloat(balance));
     } catch (err) {
-      apiError('init.l2client', err);
-      stateStore.readOnly = true;
-      this.readOnly = true;
-      return;
+      logger.error('[PolymarketClient.init] Balance check failed', {
+        error:  err.message,
+        status: err.response?.status
+      });
     }
 
-    // Step 5 — Get initial USDC balance
-    try {
-      const balance = await this.getUSDCBalance();
-      stateStore.setWallet(
-        this.funder || this.wallet.address,
-        parseFloat(balance)
-      );
-      logger.info(`[PolymarketClient.init] Wallet ready — USDC balance: $${balance}`);
-    } catch (err) {
-      logger.warn('[PolymarketClient.init] Could not fetch initial USDC balance', { error: err.message });
-    }
+    await this.ensureAllowance();
 
     // Step 6 — Heartbeat (CRITICAL — keeps WS session alive)
     let heartbeatId = '';
@@ -331,11 +356,13 @@ class PolymarketClient {
 
   connectUserWebSocket() {
     if (!this.apiCreds || this.readOnly) return;
+    this._wsRetryCount = 0;
 
     const connect = () => {
       const ws = new WebSocket(USER_WS_URL);
 
       ws.on('open', () => {
+        this._wsRetryCount = 0; // reset on successful connect
         logger.info('[PolymarketClient.userWS] Connected — subscribing to user events');
         ws.send(JSON.stringify({
           auth: {
@@ -373,13 +400,22 @@ class PolymarketClient {
       });
 
       ws.on('close', () => {
-        logger.warn('[PolymarketClient.userWS] Disconnected — reconnecting in 3s');
-        setTimeout(connect, 3000);
+        this._wsRetryCount++;
+        if (this._wsRetryCount > 5) {
+          logger.warn('[PolymarketClient.userWS] Giving up after 5 retries — order fills via REST polling only');
+          return;
+        }
+        const backoffMs = Math.min(30000, 3000 * Math.pow(2, this._wsRetryCount - 1));
+        logger.warn('[PolymarketClient.userWS] Disconnected — reconnecting', {
+          attempt: this._wsRetryCount,
+          backoffMs
+        });
+        setTimeout(connect, backoffMs);
       });
 
       ws.on('error', (err) => {
         logger.warn('[PolymarketClient.userWS] Error', { error: err.message });
-        // close handler will reconnect
+        // close handler will reconnect with backoff
       });
     };
 
@@ -425,6 +461,18 @@ class PolymarketClient {
     }
   }
 
+  // ── Allowance ─────────────────────────────────────────────────────────────
+
+  async ensureAllowance() {
+    if (this.readOnly || !this.client) return;
+    try {
+      await this.client.updateBalanceAllowance({ asset_type: 'COLLATERAL' });
+      logger.info('[PolymarketClient] USDC allowance set');
+    } catch (e) {
+      logger.debug('[PolymarketClient] allowance update', { error: e.message });
+    }
+  }
+
   // ── Order Placement ───────────────────────────────────────────────────────
 
   async placeOrder({ tokenId, side, usdcAmount, marketQuestion }) {
@@ -441,6 +489,8 @@ class PolymarketClient {
       logger.error(`[PolymarketClient.${fn}] No authenticated client — cannot place order`, ctx);
       throw new Error('CLOB client not initialized');
     }
+
+    await this.ensureAllowance();
 
     try {
       // Step 1 — Get market params
@@ -465,19 +515,22 @@ class PolymarketClient {
       const ticks = Math.round(parseFloat(tickSize) || 0.01);
       price = Math.round(price / ticks) * ticks;
 
-      logger.info(`[PolymarketClient.${fn}] Placing FAK order`, {
+      logger.info(`[PolymarketClient.${fn}] Placing GTC order`, {
         ...ctx, price, tickSize, negRisk
       });
 
-      // Step 4 — Place FAK market order
+      // Step 4 — Place GTC limit order (stays open until filled)
       const resp = await this.client.createAndPostMarketOrder(
         { tokenID: tokenId, side: clobSide, amount: usdcAmount, price },
         { tickSize, negRisk },
-        this.OrderType.FAK
+        this.OrderType.GTC
       );
 
       logger.info(`[PolymarketClient.${fn}] Order placed`, {
         ...ctx, orderId: resp?.orderID || resp?.order_id, status: resp?.status
+      });
+      logger.info(`[PolymarketClient.${fn}] Order response`, {
+        response: JSON.stringify(resp).slice(0, 300)
       });
       return resp;
     } catch (err) {

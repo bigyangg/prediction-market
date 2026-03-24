@@ -1,14 +1,15 @@
 'use strict';
 // ─────────────────────────────────────────────────────────────────────────────
-// COST MODEL (Two-Model Architecture):
+// COST MODEL (Three-Model Architecture):
 //
-// Haiku scout:  ~$0.001/market × N markets per scan
-// Sonnet judge: ~$0.015/market × approved markets only
-// Estimated per scan: $0.01 scout + $0.03-0.05 judge = ~$0.04-0.06 total
-// vs single-Sonnet:   $0.15 if Sonnet ran on everything (60-70% reduction)
+// Layer 1 — Haiku scout:    ~$0.001/market × N markets per scan
+// Layer 2 — Gemini judge:   ~$0.0005/market × scout-approved markets (NEW)
+// Layer 3 — Sonnet arbiter: ~$0.015/market × only high-conviction + big markets
 //
-// With $10 Anthropic credit: ~150-250 full scan cycles
-// At 45s interval: ~2-3 hours of trading per $1 spent
+// Estimated per scan: $0.01 scout + $0.05 Gemini + rare Sonnet ≈ $0.001 avg
+// vs old two-model:   $0.01 scout + $0.03–0.05 Sonnet (94% reduction on judge)
+//
+// With $10 Anthropic credit: Sonnet only fires on edge≥6%, conf≥60%, liq≥$500k
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const Anthropic   = require('@anthropic-ai/sdk');
@@ -19,6 +20,7 @@ const newsFetcher = require('../core/newsFetcher');
 const polymarket  = require('../core/polymarketClient');
 const persistence       = require('../core/persistence');
 const geminiValidator   = require('../core/geminiValidator');
+const geminiJudge       = require('../core/geminiJudge');
 const traderTracker     = require('../core/traderTracker');
 
 // ── Model config — read from env with exact fallbacks ─────────────────────────
@@ -250,9 +252,10 @@ class BaseAgent {
     // ── Phase 2: Fetch news context once (cached 60s) ────────────────────────
     const newsCtx = await newsFetcher.getContextForCategory(this.category);
 
-    // ── Phase 3: Sonnet deep-analyzes approved markets (1500ms before each) ─
-    logger.info(`[${this.name}] [${scanId}] Sending ${approved_} approved markets to Sonnet`, {
-      judgeModel: JUDGE_MODEL
+    // ── Phase 3: Gemini judges first; Sonnet only for high-conviction + big markets ─
+    logger.info(`[${this.name}] [${scanId}] Sending ${approved_} approved markets to GeminiJudge`, {
+      geminiModel: geminiJudge.modelName,
+      judgeModel:  JUDGE_MODEL
     });
 
     for (const market of approved) {
@@ -260,8 +263,61 @@ class BaseAgent {
         logger.info(`[${this.name}] Judge loop aborted — engine stopped/halted`);
         break;
       }
-      await delay(1500); // 1500ms before each Sonnet call
-      await this.analyzeMarket(market, newsCtx, scanId);
+      await delay(1500);
+
+      // Step 1: Try Gemini first (cheap — $0.30/$2.50 per 1M tokens)
+      let decision    = await geminiJudge.analyze(market, newsCtx);
+      let usedSonnet  = false;
+
+      if (!decision) {
+        // Gemini unavailable — fall back to full Sonnet path
+        await this.analyzeMarket(market, newsCtx, scanId);
+        continue;
+      }
+
+      decision.market_probability = market.marketProb ?? this._getMarketProbability(market);
+
+      if (
+        decision.trade !== 'SKIP' &&
+        Math.abs(decision.edge || 0) >= 6 &&
+        decision.confidence >= 60 &&
+        (market.liquidity || 0) >= 500000  // only big markets worth Sonnet's cost
+      ) {
+        // High conviction Gemini signal — get Sonnet's second opinion
+        logger.info('High conviction — requesting Sonnet arbiter', {
+          geminiEdge: decision.edge,
+          geminiConf: decision.confidence,
+          market:     market.question?.slice(0, 50)
+        });
+        const sonnetDecision = await this._callSonnet(market, newsCtx, scanId);
+        usedSonnet = true;
+
+        if (sonnetDecision) {
+          if (sonnetDecision.trade === decision.trade) {
+            // Both agree — high confidence trade
+            decision = sonnetDecision;
+            decision.dualConfirmed = true;
+            logger.info('DUAL CONFIRMED — Gemini + Sonnet agree', {
+              trade: decision.trade,
+              edge:  decision.edge
+            });
+          } else {
+            // Disagreement — be conservative
+            logger.info('Models DISAGREE — being conservative', {
+              gemini: decision.trade,
+              sonnet: sonnetDecision.trade
+            });
+            decision.trade  = 'SKIP';
+            decision.reason = 'model disagreement — skipping';
+          }
+        }
+      }
+
+      // Track which model made the final decision
+      decision._model        = usedSonnet ? 'sonnet' : 'gemini';
+      decision._dualConfirmed = decision.dualConfirmed || false;
+
+      await this._finalizeDecision(market, decision, scanId);
     }
   }
 
@@ -355,10 +411,11 @@ Respond with ONLY this JSON, nothing else, no markdown:
     }
   }
 
-  // ── MODEL 2: Sonnet Judge ─────────────────────────────────────────────────
-  // Deep analysis with full news context. Only called for Haiku-approved markets.
+  // ── MODEL 2: Sonnet Arbiter ───────────────────────────────────────────────
+  // Calls Sonnet and returns a parsed decision object, or null on error.
+  // Called only when Gemini is unavailable OR for high-conviction confirmation.
 
-  async analyzeMarket(market, newsCtx, scanId) {
+  async _callSonnet(market, newsCtx, scanId) {
     const question   = market.question || market.title || 'Unknown market';
     const marketProb = this._getMarketProbability(market);
     const ctx = {
@@ -396,7 +453,6 @@ Analyze this market for mispricing. Output valid JSON only.`;
         model:          JUDGE_MODEL,
         max_tokens:     400,
         system:         JUDGE_SYSTEM_PROMPT,
-        stop_sequences: ['\n\n', '```'],
         messages:       [{ role: 'user', content: userPrompt }]
       });
       const elapsed = Date.now() - t0;
@@ -418,28 +474,30 @@ Analyze this market for mispricing. Output valid JSON only.`;
           agent: this.name
         });
         decision = {
-          trade:             'SKIP',
-          true_probability:  marketProb,
-          confidence:        0,
-          edge:              0,
-          risk_level:        'HIGH',
-          time_sensitivity:  'LOW',
-          reason:            'response parse failed',
-          key_factor:        'none',
-          warning:           'response parsing failed',
+          trade:              'SKIP',
+          true_probability:   marketProb,
+          confidence:         0,
+          edge:               0,
+          risk_level:         'HIGH',
+          time_sensitivity:   'LOW',
+          reason:             'response parse failed',
+          key_factor:         'none',
+          warning:            'response parsing failed',
           market_probability: marketProb,
-          _parseError:       true
+          _parseError:        true
         };
       }
 
-      logger.info(`[${this.name}] [Judge] Decision received`, {
+      logger.info(`[${this.name}] [Sonnet] Decision received`, {
         ...ctx, trade: decision.trade, edge: decision.edge,
         confidence: decision.confidence, risk: decision.risk_level,
         latencyMs: elapsed, parseError: decision._parseError || false
       });
 
-      // Fix D — edge recalculation: if Claude said YES/NO but edge is near zero,
-      // recompute from the probabilities it returned (catches miscalculation)
+      decision.market_probability = decision.market_probability || marketProb;
+
+      // Edge recalculation: if Sonnet said YES/NO but edge is near zero,
+      // recompute from the probabilities it returned
       if (decision.trade !== 'SKIP' && Math.abs(decision.edge || 0) < 1) {
         const recalcEdge = (decision.true_probability || 0) - (decision.market_probability || marketProb);
         if (Math.abs(recalcEdge) >= 2) {
@@ -451,57 +509,94 @@ Analyze this market for mispricing. Output valid JSON only.`;
         }
       }
 
-      // ═══ JUDGE DECISION ═══ — full output for trade flow diagnosis
-      logger.info('═══ JUDGE DECISION ═══ ' + JSON.stringify({
+      logger.info('═══ SONNET DECISION ═══ ' + JSON.stringify({
         TRADE:      decision.trade,
         EDGE:       decision.edge,
         CONFIDENCE: decision.confidence,
         RISK:       decision.risk_level,
         TRUE_PROB:  decision.true_probability,
-        MKT_PROB:   decision.market_probability || marketProb,
+        MKT_PROB:   decision.market_probability,
         REASON:     decision.reason
       }));
-    } catch (err) {
-      const code = this._logClaudeError(err, 'Sonnet Judge', ctx);
-      if (code === 'auth_error' || code === 'credits_exhausted') {
-        logger.error(`[${this.name}] INVALID API KEY or NO CREDITS — stopping engine`);
+
+      return decision;
+
+    } catch (e) {
+      logger.error('[Sonnet Judge] API call FAILED', {
+        message:      e.message,
+        status:       e.status,
+        errorType:    e.error?.type,
+        errorMessage: e.error?.error?.message,
+        headers:      e.headers
+      });
+
+      if (e.status === 401) {
+        logger.error('AUTH ERROR — ANTHROPIC_API_KEY is invalid or revoked');
+        logger.error('Go to console.anthropic.com → API Keys → verify key is active');
         stateStore.setEngineRunning(false);
-        return;
-      }
-      if (code === 'rate_limited') {
-        logger.warn(`[${this.name}] Rate limited — pausing agent for 30 seconds`);
+        return null;
+      } else if (e.status === 402) {
+        logger.error('PAYMENT REQUIRED — add credits at console.anthropic.com');
+        stateStore.setEngineRunning(false);
+        return null;
+      } else if (e.status === 429) {
+        logger.error('RATE LIMITED — too many requests');
         await delay(30000);
+      } else if (!e.status) {
+        logger.error('NETWORK ERROR — cannot reach api.anthropic.com from Railway');
+        logger.error('Check Railway region settings');
       }
+
       stateStore.addNews({ agent: this.name, text: `ERROR: Sonnet unavailable — ${question.slice(0, 50)}`, type: 'skip' });
-      return;
+      return {
+        trade:              'SKIP',
+        edge:               0,
+        confidence:         0,
+        reason:             `API error ${e.status || 'network'}`,
+        true_probability:   50,
+        market_probability: marketProb,
+        risk_level:         'HIGH',
+        time_sensitivity:   'LOW',
+        key_factor:         'none',
+        warning:            'API failed'
+      };
     }
+  }
+
+  // ── Post-decision pipeline ─────────────────────────────────────────────────
+  // Risk approval → Gemini validation → trade execution.
+  // Called after either Gemini or Sonnet has produced a decision.
+
+  async _finalizeDecision(market, decision, scanId) {
+    const question = market.question || market.title || 'Unknown market';
+    const marketProb = decision.market_probability || this._getMarketProbability(market);
+    const ctx = { scanId, agent: this.name, market: question.slice(0, 80), marketProb };
 
     stateStore.addNews({
       agent: this.name,
-      text:  `${decision.trade} | ${decision.edge >= 0 ? '+' : ''}${decision.edge}% edge | ${question.slice(0, 70)}`,
+      text:  `${decision.trade} | ${decision.edge >= 0 ? '+' : ''}${decision.edge}% edge | ${decision._model || '?'} | ${question.slice(0, 60)}`,
       type:  decision.trade === 'SKIP' ? 'skip' : 'signal'
     });
 
     // Save judge decision to Supabase before approval check
     persistence.saveDecision({
-      agent:             this.name,
-      marketId:          market.id,
-      question:          market.question,
-      category:          market.category,
-      scoutVerdict:      'PASS',
-      claudeTrade:       decision.trade,
-      claudeEdge:        decision.edge,
-      claudeConfidence:  decision.confidence,
-      claudeTrueProb:    decision.true_probability,
-      claudeRisk:        decision.risk_level,
-      claudeReason:      decision.reason,
-      finalAction:       'pending'
+      agent:            this.name,
+      marketId:         market.id,
+      question:         market.question,
+      category:         market.category,
+      scoutVerdict:     'PASS',
+      claudeTrade:      decision.trade,
+      claudeEdge:       decision.edge,
+      claudeConfidence: decision.confidence,
+      claudeTrueProb:   decision.true_probability,
+      claudeRisk:       decision.risk_level,
+      claudeReason:     decision.reason,
+      finalAction:      'pending'
     }).catch(() => {});
 
     // Risk approval gate — ONLY path to execution (REQ-RSK-001)
     const approval = riskManager.approve(decision);
 
-    // ═══ APPROVAL RESULT ═══
     logger.info('═══ APPROVAL RESULT ═══ ' + JSON.stringify({
       approved: approval.approved,
       REASON:   approval.reason || 'approved',
@@ -533,7 +628,7 @@ Analyze this market for mispricing. Output valid JSON only.`;
     });
 
     if (validation.verdict === 'VETO') {
-      logger.warn(`[${this.name}] Trade VETOED by Gemini`, {
+      logger.warn(`[${this.name}] Trade VETOED by GeminiValidator`, {
         ...ctx, reason: validation.reason, concern: validation.key_concern,
         confidence: validation.confidence, searchUsed: validation.search_used
       });
@@ -542,33 +637,42 @@ Analyze this market for mispricing. Output valid JSON only.`;
         text:  `VETOED by Gemini: ${validation.reason} — ${question.slice(0, 50)}`,
         type:  'skip'
       });
-      // Persist veto decision
       persistence.saveDecision({
-        agent:           this.name,
-        marketId:        market.id,
-        question:        market.question,
-        category:        market.category,
-        scoutVerdict:    'PASS',
-        claudeTrade:     decision.trade,
-        claudeEdge:      decision.edge,
+        agent:            this.name,
+        marketId:         market.id,
+        question:         market.question,
+        category:         market.category,
+        scoutVerdict:     'PASS',
+        claudeTrade:      decision.trade,
+        claudeEdge:       decision.edge,
         claudeConfidence: decision.confidence,
-        geminiVerdict:   'VETO',
+        geminiVerdict:    'VETO',
         geminiConfidence: validation.confidence,
-        geminiReason:    validation.reason,
-        finalAction:     'gemini_veto',
-        rejectionReason: validation.key_concern
+        geminiReason:     validation.reason,
+        finalAction:      'gemini_veto',
+        rejectionReason:  validation.key_concern
       }).catch(() => {});
       return;
     }
 
-    // Gemini confirmed — proceed
     if (!validation._skipped && !validation._error) {
-      logger.info(`[${this.name}] Trade CONFIRMED by Gemini`, {
+      logger.info(`[${this.name}] Trade CONFIRMED by GeminiValidator`, {
         reason: validation.reason, searchUsed: validation.search_used
       });
     }
 
     await this.executeTrade(market, decision, approval.stake, scanId);
+  }
+
+  // ── Full Sonnet path (Gemini unavailable OR manual trades) ────────────────
+  // Calls Sonnet and runs the full post-decision pipeline.
+
+  async analyzeMarket(market, newsCtx, scanId) {
+    const decision = await this._callSonnet(market, newsCtx, scanId);
+    if (!decision) return;
+    decision._model        = 'sonnet';
+    decision._dualConfirmed = false;
+    await this._finalizeDecision(market, decision, scanId);
   }
 
   // ── Trade Execution ───────────────────────────────────────────────────────
@@ -591,6 +695,8 @@ Analyze this market for mispricing. Output valid JSON only.`;
       riskLevel: decision.risk_level, reason: decision.reason,
       warning: decision.warning, keyFactor: decision.key_factor,
       status: 'open', orderId: null, simulated: false,
+      decisionModel: decision._model || 'sonnet',
+      dualConfirmed: decision._dualConfirmed || false,
       ts: new Date().toISOString()
     };
 
@@ -684,9 +790,13 @@ Analyze this market for mispricing. Output valid JSON only.`;
   // ── Market helpers ────────────────────────────────────────────────────────
 
   _getMarketProbability(market) {
+    // marketProb is pre-computed by mapMarket normalization
+    if (market.marketProb !== undefined) return market.marketProb;
     if (market.outcomePrices) {
       try {
-        const prices = JSON.parse(market.outcomePrices);
+        const prices = Array.isArray(market.outcomePrices)
+          ? market.outcomePrices
+          : JSON.parse(market.outcomePrices);
         return Math.round(parseFloat(prices[0]) * 100);
       } catch { /* fall through */ }
     }
@@ -696,13 +806,46 @@ Analyze this market for mispricing. Output valid JSON only.`;
   }
 
   _getTokenId(market, side) {
-    if (market.clobTokenIds) {
+    // tokenIds is a pre-parsed array from mapMarket normalization
+    // clobTokenIds is also set to the same array by mapMarket
+    let ids = null;
+
+    if (Array.isArray(market.tokenIds) && market.tokenIds.length > 0) {
+      ids = market.tokenIds;
+    } else if (market.clobTokenIds) {
       try {
-        const ids = JSON.parse(market.clobTokenIds);
-        return side === 'YES' ? ids[0] : ids[1];
-      } catch { /* fall through */ }
+        ids = Array.isArray(market.clobTokenIds)
+          ? market.clobTokenIds
+          : JSON.parse(market.clobTokenIds);
+      } catch (e) {
+        logger.error('_getTokenId: failed to parse clobTokenIds', {
+          raw: market.clobTokenIds, error: e.message
+        });
+      }
     }
-    return market.tokenId || market.conditionId || '';
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      logger.error('_getTokenId: no tokenIds found', {
+        market: market.question?.slice(0, 50),
+        tokenIds: market.tokenIds,
+        clobTokenIds: market.clobTokenIds
+      });
+      return market.tokenId || market.conditionId || '';
+    }
+
+    const tokenId = side === 'YES' ? ids[0] : ids[1];
+    if (!tokenId) {
+      logger.error('_getTokenId: empty tokenId for side', { side, ids });
+      return '';
+    }
+
+    logger.info('Token resolved', {
+      side,
+      tokenId,
+      tokenIds: ids,
+      market: market.question?.slice(0, 50)
+    });
+    return tokenId;
   }
 
   // ── Override in subclasses ─────────────────────────────────────────────────

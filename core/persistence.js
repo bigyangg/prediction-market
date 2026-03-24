@@ -32,7 +32,9 @@ async function saveTrade(trade) {
       gemini_reason:    trade.geminiReason,
       pnl:              trade.pnl,
       opened_at:        trade.openedAt || trade.ts,
-      order_id:         trade.orderId
+      order_id:         trade.orderId,
+      decision_model:   trade.decisionModel,
+      dual_confirmed:   trade.dualConfirmed || false
     });
     if (error) {
       logger.error('saveTrade FAILED', { error: error.message, code: error.code, tradeId: trade.id });

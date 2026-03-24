@@ -62,8 +62,10 @@ async function boot() {
       logger.info(`[Boot] Funder: ${funderAddr} | Balance: $${initBal} USDC`);
     }
 
-    // 2. Init Gemini validator
+    // 2. Init Gemini validator + Gemini judge
     await geminiValidator.init();
+    const geminiJudge = require('./core/geminiJudge');
+    await geminiJudge.init();
 
     // 2b. Connect to Supabase
     logger.info('[Boot] Connecting to Supabase…');

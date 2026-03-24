@@ -240,7 +240,8 @@ class StateStore extends EventEmitter {
       newsFeed:      this.newsFeed,
       realPnl:       this.realPnl,
       realPositions: this.realPositions,
-      realTrades:    this.realTrades.slice(0, 50)
+      realTrades:    this.realTrades.slice(0, 50),
+      geminiJudge:   require('./geminiJudge').getStats()
     };
   }
 }

@@ -699,6 +699,11 @@
         <div class="s-label">Loss Limit</div>
         <div class="s-value" id="loss-pct">0%</div>
       </div>
+      <div class="stat-cell">
+        <div class="s-label">Gemini Judge</div>
+        <div class="s-value" id="gemini-skip-rate">—%</div>
+        <div class="s-sub" id="gemini-calls">0 analyzed</div>
+      </div>
     </div>
 
     <!-- Loss limit bar -->
@@ -1042,6 +1047,11 @@ function renderStats() {
   const lp = s.riskStats ? s.riskStats.dailyLossUsedPct : 0;
   el('loss-pct').textContent  = (lp || 0) + '%';
   el('loss-pct').className    = 's-value ' + (lp > 75 ? 'red' : lp > 50 ? 'yellow' : 'green');
+  const gj = s.geminiJudge;
+  if (gj) {
+    el('gemini-skip-rate').textContent = gj.skipRate + '% skip';
+    el('gemini-calls').textContent     = (gj.calls || 0) + ' analyzed';
+  }
   renderLossBar();
 }
 
@@ -1217,9 +1227,14 @@ function renderTrades() {
   }
   tbody.innerHTML = trades.map(t => {
     const ts = t.ts ? new Date(t.ts).toLocaleTimeString() : '—';
+    const modelBadge = t.dualConfirmed
+      ? `<span style="background:#b8860b;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:3px">G+S ✓</span>`
+      : t.decisionModel === 'gemini'
+        ? `<span style="background:#1a6fb5;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:3px">G</span>`
+        : `<span style="background:#5b3d8a;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:3px">S</span>`;
     return `<tr>
       <td class="ts">${ts}</td>
-      <td style="font-size:11px">${escHtml(t.agent || '—')}</td>
+      <td style="font-size:11px">${escHtml(t.agent || '—')}${modelBadge}</td>
       <td><span class="badge ${t.side}">${escHtml(t.side)}</span></td>
       <td class="num">$${parseFloat(t.stake||0).toFixed(2)}</td>
       <td class="num ${parseFloat(t.edge||0)>=0?'green':'red'}">${t.edge!=null?(t.edge>0?'+':'')+t.edge+'%':'—'}</td>
