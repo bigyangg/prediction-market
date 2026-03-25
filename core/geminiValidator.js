@@ -137,8 +137,8 @@ class GeminiValidator {
         model:    this.modelName,
         contents: VALIDATOR_PROMPT(market, claudeDecision),
         config: {
-          tools:           [{ googleSearch: {} }],  // live web search
-          temperature:     0.1,                     // low temp = consistent JSON
+          // tools: [{ googleSearch: {} }],  // disabled — causing failures
+          temperature:     0.1,              // low temp = consistent JSON
           maxOutputTokens: 300
         }
       });

@@ -151,7 +151,9 @@ class StateStore extends EventEmitter {
 
   setWallet(address, balance) {
     this.walletAddress = address;
-    this.usdcBalance = balance;
+    // If balance looks like raw micro-USDC (>10000 and no decimal context), divide by 1e6
+    if (balance > 10000) balance = balance / 1e6;
+    this.usdcBalance = parseFloat(balance) || 0;
     this.emit('state', this.snapshot());
   }
 

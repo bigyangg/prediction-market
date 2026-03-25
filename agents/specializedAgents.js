@@ -54,6 +54,35 @@ class EconomicsAgent extends BaseAgent {
 class SportsAgent extends BaseAgent {
   constructor() {
     super({ name: 'SportsAgent', category: 'sports', intervalSeconds: 50 });
+    this._sportsMeta = null;  // Cache sports metadata
+  }
+
+  async fetchSportsMeta() {
+    if (this._sportsMeta) return this._sportsMeta;
+    try {
+      const axios = require('axios');
+      const res = await axios.get('https://gamma-api.polymarket.com/sports', {
+        timeout: 5000
+      });
+      this._sportsMeta = res.data || [];
+      const logger = require('../core/logger');
+      logger.debug('Sports metadata loaded', { count: this._sportsMeta.length });
+      return this._sportsMeta;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  async buildContext(market) {
+    const meta = await this.fetchSportsMeta();
+    // Find matching sport for this market
+    const sport = meta.find(s =>
+      market.question?.toLowerCase().includes(s.sport?.toLowerCase())
+    );
+    if (sport?.resolution) {
+      return `Resolution source: ${sport.resolution}\nOrdering: ${sport.ordering || 'N/A'}`;
+    }
+    return '';
   }
 
   async getMarkets() {

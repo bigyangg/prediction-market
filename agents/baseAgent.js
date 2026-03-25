@@ -65,7 +65,7 @@ const delay = ms => new Promise(r => setTimeout(r, ms));
 // ── Robust JSON extractor — handles markdown fences + surrounding text ────────
 function extractJSON(text) {
   // Step 1: strip markdown fences
-  let clean = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+  let clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
   // Step 2: try direct parse
   try { return JSON.parse(clean); } catch (_) { /* continue */ }
@@ -82,6 +82,14 @@ function extractJSON(text) {
   const aEnd   = clean.lastIndexOf(']');
   if (aStart !== -1 && aEnd !== -1 && aEnd > aStart) {
     try { return JSON.parse(clean.slice(aStart, aEnd + 1)); } catch (_) { /* continue */ }
+  }
+
+  // Step 5: try to find JSON after newline
+  const lines = clean.split('\n');
+  for (const line of lines) {
+    if (line.trim().startsWith('{')) {
+      try { return JSON.parse(line.trim()); } catch (_) { /* continue */ }
+    }
   }
 
   throw new Error('No valid JSON found in: ' + clean.slice(0, 100));
@@ -451,7 +459,7 @@ Analyze this market for mispricing. Output valid JSON only.`;
       const t0  = Date.now();
       const msg = await this._client.messages.create({
         model:          JUDGE_MODEL,
-        max_tokens:     400,
+        max_tokens:     500,  // Increased from 400 to prevent response truncation
         system:         JUDGE_SYSTEM_PROMPT,
         messages:       [{ role: 'user', content: userPrompt }]
       });
@@ -703,9 +711,12 @@ Analyze this market for mispricing. Output valid JSON only.`;
     logger.info(`[${this.name}] Executing trade`, { ...ctx, market: question.slice(0, 60) });
 
     try {
+      // CRITICAL: Always BUY — we buy YES token (index 0) or NO token (index 1)
+      // NEVER use SELL unless closing an existing position
+      // _getTokenId already selected the correct token based on side
       const result = await polymarket.placeOrder({
         tokenId,
-        side:            side === 'YES' ? 'BUY' : 'SELL',
+        side:            'BUY',  // Always BUY the selected token
         usdcAmount:      stake,
         marketQuestion:  question
       });
@@ -719,11 +730,28 @@ Analyze this market for mispricing. Output valid JSON only.`;
         ...ctx, orderId: trade.orderId,
         simulated: trade.simulated, market: question.slice(0, 60)
       });
+      riskManager.reservedBalance = Math.max(0, riskManager.reservedBalance - stake);
+      logger.debug('Balance released', { released: stake, remaining: riskManager.reservedBalance });
+      await polymarket.refreshWallet();
+      logger.info('Balance refreshed after trade');
+      const walletBal = stateStore.usdcBalance || 0;
+      if (riskManager.reservedBalance > walletBal) {
+        riskManager.reservedBalance = 0;
+        logger.warn('Reserved balance reset — exceeded wallet balance');
+      }
     } catch (err) {
       trade.status = 'failed';
       trade.error  = err.message;
       stateStore.recordTrade(trade);
       persistence.saveTrade(trade).catch(() => {});
+      riskManager.reservedBalance = Math.max(0, riskManager.reservedBalance - stake);
+      logger.debug('Balance released', { released: stake, remaining: riskManager.reservedBalance });
+      await polymarket.refreshWallet();
+      const walletBal = stateStore.usdcBalance || 0;
+      if (riskManager.reservedBalance > walletBal) {
+        riskManager.reservedBalance = 0;
+        logger.warn('Reserved balance reset — exceeded wallet balance');
+      }
       logger.error(`[${this.name}] Trade FAILED`, {
         ...ctx, error: err.message,
         hint: 'Order not placed — see PolymarketClient logs for details'

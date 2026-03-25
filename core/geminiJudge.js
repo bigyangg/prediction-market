@@ -107,7 +107,7 @@ Analyze and respond with JSON only.`;
         model:    this.modelName,
         contents: prompt,
         config: {
-          tools:           [{ googleSearch: {} }], // live web search
+          // tools: [{ googleSearch: {} }],  // disabled — causing failures
           temperature:     0.1,
           maxOutputTokens: 250
         }

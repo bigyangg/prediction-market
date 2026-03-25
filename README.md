@@ -237,7 +237,11 @@ prediction-market/
 ### 2. Sharp Trader Tracking
 - **`traderTracker` Engine**: Fetches Polymarket's weekly leaderboard dynamically via the profit API to track movements of top traders.
 - **Signal Generation**: Compiles the last 48h trades + current holdings (≥10 shares) and injects a "SHARP TRADER ACTIVITY" block into the Sonnet prompt for edge discovery.
-- **Dashboard UI**: New Sharp Traders panel included on the dashboard to manually add traders and auto-refresh visual feeds.
+- **Enhanced Dashboard UI**: 
+  - Rich card layout with rank badges, profile images, and PnL/volume stats
+  - Interactive leaderboard bar chart showing top 5 traders
+  - Auto-discovery from Polymarket API with full trader metadata (profileImage, xUsername, verifiedBadge)
+  - `/api/leaderboard` endpoint for programmatic access
 
 ### 3. Reliability & Persistence
 - **Supabase Integrity**: Added robust boot-time write tests to proactively detect Row Level Security (RLS) connection blocks. Detailed fix included in `DEPLOY.md`.
@@ -249,6 +253,20 @@ prediction-market/
 - **Railway Configuration**: Full `railway.json` and `.railwayignore` added. See `DEPLOY.md` for a comprehensive step-by-step deploy guide.
 - **Single Port System**: HTTP dashboard and WebSocket now seamlessly share a single port (Dashboard on `/`, WebSocket on `/ws`).
 - **Healthchecks**: Added `/health` endpoint and adjusted logging specifically for cloud container environments.
+
+### 5. Critical Bug Fixes (v2.1)
+- **USDC Balance Display**: Fixed conversion from micro-units (6 decimals) to dollars. Balance now correctly displays as `$103.29` instead of `103291356`.
+- **Order Placement Bug**: Fixed critical issue where NO trades were incorrectly using SELL instead of BUY. All new trades now correctly BUY the appropriate token (YES token index 0, NO token index 1).
+- **Order Precision**: Added proper decimal rounding to comply with Polymarket CLOB API requirements:
+  - Price rounded to 2-3 decimals based on tick size
+  - Size (shares) rounded down to 2 decimals (floor)
+  - Minimum order size validation (1 share minimum)
+- **JSON Parsing**: Enhanced `extractJSON()` with line-by-line fallback and increased Sonnet `max_tokens` from 400 to 500 to prevent response truncation.
+- **Chart.js Stability**: Fixed leaderboard chart resize loop by disabling responsive mode and implementing change-detection before updates.
+
+### 6. Sports Metadata Integration
+- **SportsAgent Enhancement**: Added `fetchSportsMeta()` method to pull resolution sources and ordering info from Polymarket `/sports` endpoint.
+- **Context Enrichment**: Sports markets now include resolution source and ordering data in analysis prompts.
 
 ---
 

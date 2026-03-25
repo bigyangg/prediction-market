@@ -93,7 +93,13 @@ function apiError(fn, err, extra = {}) {
   } else if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
     logger.warn(`[PolymarketClient.${fn}] TIMED OUT`, extra);
   } else {
-    logger.warn(`[PolymarketClient.${fn}] FAILED`, { status, detail, ...extra });
+    logger.error(`[PolymarketClient.${fn}] FAILED`, { 
+      error: err.message,
+      status, 
+      detail: JSON.stringify(detail).slice(0, 200),
+      code: err.code,
+      ...extra 
+    });
   }
 }
 
@@ -287,8 +293,10 @@ class PolymarketClient {
     if (this.readOnly || !this.client) return '0.00';
     try {
       // Use CLOB API balance endpoint — no RPC needed
+      // Polymarket returns balance in micro-units (6 decimals): 103291356 / 1e6 = $103.29
       const bal = await this.client.getBalanceAllowance({ asset_type: 'COLLATERAL' });
-      return parseFloat(bal?.balance || 0).toFixed(2);
+      const rawBalance = parseInt(bal?.balance || 0);
+      return (rawBalance / 1e6).toFixed(2);
     } catch (e) {
       logger.debug('getUSDCBalance failed', { error: e.message });
       return '0.00';
@@ -298,6 +306,7 @@ class PolymarketClient {
   async refreshWallet() {
     const balance = await this.getUSDCBalance();
     const addr    = this.funder || this.wallet?.address || null;
+    // balance is already divided by 1e6 from getUSDCBalance()
     stateStore.setWallet(addr, parseFloat(balance));
     return { address: addr, balance };
   }
@@ -490,38 +499,110 @@ class PolymarketClient {
       throw new Error('CLOB client not initialized');
     }
 
+    // Real-time balance check — guards against stale balance when multiple agents fire simultaneously
+    const currentBal = await this.getUSDCBalance();
+    const balanceNum = parseFloat(currentBal);
+    if (balanceNum < usdcAmount * 1.05) {
+      logger.warn(`[PolymarketClient.${fn}] Insufficient balance for trade`, {
+        balance:  balanceNum,
+        required: usdcAmount,
+        market:   (marketQuestion || '').slice(0, 50)
+      });
+      return { success: false, reason: 'insufficient balance' };
+    }
+
     await this.ensureAllowance();
+
+    // Variables to track for error logging
+    let roundedPrice = null;
+    let roundedSize = null;
 
     try {
       // Step 1 — Get market params
-      const [tickSize, negRisk] = await Promise.all([
-        this.client.getTickSize(tokenId).catch(() => 0.01),
-        this.client.getNegRisk(tokenId).catch(() => false)
-      ]);
+      let tickSize = 0.01;  // default
+      let negRisk = false;
+      try {
+        const ts = await this.client.getTickSize(tokenId);
+        tickSize = parseFloat(ts?.minimum_tick_size || ts || 0.01);
+      } catch (e) {
+        logger.debug('getTickSize failed, using default 0.01', { 
+          error: e.message, 
+          tokenId: tokenId?.slice(0, 20) 
+        });
+      }
+      try {
+        negRisk = await this.client.getNegRisk(tokenId);
+      } catch (e) {
+        logger.debug('getNegRisk failed, using default false', { 
+          error: e.message, 
+          tokenId: tokenId?.slice(0, 20) 
+        });
+      }
 
       // Step 2 — Get orderbook for best price
-      const book    = await this.client.getOrderBook(tokenId);
+      let book = null;
+      try {
+        book = await this.client.getOrderBook(tokenId);
+      } catch (e) {
+        logger.warn('getOrderBook failed, using fallback prices', {
+          error: e.message,
+          tokenId: tokenId?.slice(0, 20)
+        });
+      }
       const bestAsk = parseFloat(book?.asks?.[0]?.price || 0.55);
       const bestBid = parseFloat(book?.bids?.[0]?.price || 0.45);
 
-      // Step 3 — Slippage-protected price (round to tickSize)
-      let price;
-      const clobSide = side === 'BUY' ? this.Side.BUY : this.Side.SELL;
+      // Step 3 — Calculate price with slippage protection
+      let tokenPrice;
       if (side === 'BUY') {
-        price = Math.min(bestAsk + 0.02, 0.97);
+        tokenPrice = Math.min(bestAsk + 0.02, 0.97);
       } else {
-        price = Math.max(bestBid - 0.02, 0.03);
+        tokenPrice = Math.max(bestBid - 0.02, 0.03);
       }
-      const ticks = Math.round(parseFloat(tickSize) || 0.01);
-      price = Math.round(price / ticks) * ticks;
 
-      logger.info(`[PolymarketClient.${fn}] Placing GTC order`, {
-        ...ctx, price, tickSize, negRisk
+      // Round price to tick size precision
+      // Price precision: tick size >= 0.01 → 2 decimals, else 3 decimals
+      const pricePrecision = tickSize >= 0.01 ? 2 : 3;
+      roundedPrice = parseFloat(tokenPrice.toFixed(pricePrecision));
+
+      // Calculate order size (shares to buy)
+      // Size must be rounded to 2 decimals (taker amount max 2 decimals)
+      const rawSize = usdcAmount / roundedPrice;
+      roundedSize = Math.floor(rawSize * 100) / 100;  // floor to 2 decimals
+
+      // Minimum order size check
+      if (roundedSize < 1) {
+        logger.warn(`[PolymarketClient.${fn}] Order size too small`, {
+          size: roundedSize,
+          stake: usdcAmount,
+          price: roundedPrice,
+          market: (marketQuestion || '').slice(0, 50)
+        });
+        return { success: false, reason: 'size too small (min 1 share)' };
+      }
+
+      logger.info(`[PolymarketClient.${fn}] Order params resolved`, {
+        tokenId: tokenId.slice(0, 15) + '...',
+        price: roundedPrice,
+        size: roundedSize,
+        stake: usdcAmount,
+        tickSize,
+        negRisk,
+        market: (marketQuestion || '').slice(0, 50)
       });
 
-      // Step 4 — Place GTC limit order (stays open until filled)
+      // Step 4 — Create order with rounded values
+      const clobSide = side === 'BUY' ? this.Side.BUY : this.Side.SELL;
+      const marketOrder = {
+        tokenID: tokenId,
+        price: roundedPrice,
+        size: roundedSize,
+        side: clobSide
+      };
+
+      // Step 5 — Place GTC limit order (stays open until filled)
       const resp = await this.client.createAndPostMarketOrder(
-        { tokenID: tokenId, side: clobSide, amount: usdcAmount, price },
+        marketOrder,
         { tickSize, negRisk },
         this.OrderType.GTC
       );
@@ -535,20 +616,38 @@ class PolymarketClient {
       return resp;
     } catch (err) {
       const status = err.response?.status;
+      
+      // Enhanced error logging with full order details
+      const errorContext = {
+        error: err.message,
+        status: err.status || err.response?.status,
+        data: JSON.stringify(err.response?.data || err.error || '').slice(0, 200),
+        code: err.code,
+        tokenId: tokenId?.slice(0, 20),
+        price: roundedPrice,
+        size: roundedSize,
+        side: 'BUY',
+        stake: usdcAmount,
+        market: (marketQuestion || '').slice(0, 50)
+      };
+      
       if (status === 400) {
         logger.error(`[PolymarketClient.${fn}] Bad request — CLOB rejected order`, {
-          ...ctx, detail: err.response?.data, hint: 'Check tokenId, price, and usdcAmount'
+          ...errorContext, 
+          hint: 'Check tokenId, price, and size precision'
         });
       } else if (status === 401 || status === 403) {
         logger.error(`[PolymarketClient.${fn}] Auth failure`, {
-          ...ctx, hint: 'Verify POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS'
+          ...errorContext, 
+          hint: 'Verify POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS'
         });
       } else if (status === 429) {
         logger.error(`[PolymarketClient.${fn}] Rate limited`, {
-          ...ctx, retryAfter: err.response?.headers?.['retry-after']
+          ...errorContext, 
+          retryAfter: err.response?.headers?.['retry-after']
         });
       } else {
-        apiError(fn, err, ctx);
+        logger.error(`[PolymarketClient.${fn}] FAILED`, errorContext);
       }
       throw err;
     }

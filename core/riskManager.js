@@ -5,13 +5,14 @@ const stateStore = require('./stateStore');
 
 class RiskManager {
   constructor() {
-    this.maxStake       = parseFloat(process.env.MAX_STAKE_USD)        || 20;
-    this.minStake       = parseFloat(process.env.MIN_STAKE_USD)        || 1;
-    this.dailyLossLimit = parseFloat(process.env.DAILY_LOSS_LIMIT_USD) || 50;
-    this.maxOpenTrades  = parseInt(process.env.MAX_OPEN_TRADES)        || 8;
-    this.minEdge        = parseFloat(process.env.MIN_EDGE_PCT)         || 5;
-    this.minConfidence  = parseFloat(process.env.MIN_CONFIDENCE_PCT)   || 62;
-    this._modeLogged    = false;
+    this.maxStake        = parseFloat(process.env.MAX_STAKE_USD)        || 20;
+    this.minStake        = parseFloat(process.env.MIN_STAKE_USD)        || 1;
+    this.dailyLossLimit  = parseFloat(process.env.DAILY_LOSS_LIMIT_USD) || 50;
+    this.maxOpenTrades   = parseInt(process.env.MAX_OPEN_TRADES)        || 8;
+    this.minEdge         = parseFloat(process.env.MIN_EDGE_PCT)         || 5;
+    this.minConfidence   = parseFloat(process.env.MIN_CONFIDENCE_PCT)   || 62;
+    this._modeLogged     = false;
+    this.reservedBalance = 0;  // balance reserved for pending orders
   }
 
   // ── Simulation mode — relaxed thresholds when no real wallet ─────────────
@@ -93,8 +94,17 @@ class RiskManager {
     }
 
     // All conditions passed — calculate stake
-    const stake = this.calcStake(edge, confidence, risk_level);
+    const stake     = this.calcStake(edge, confidence, risk_level);
+    const available = (stateStore.usdcBalance || 0) - this.reservedBalance;
+    if (available < stake) {
+      return { approved: false, reason: `Insufficient balance: $${available.toFixed(2)} available` };
+    }
+    this.reservedBalance += stake;
     return { approved: true, stake };
+  }
+
+  releaseReserved(stake) {
+    this.reservedBalance = Math.max(0, this.reservedBalance - stake);
   }
 
   get engineHalted() {

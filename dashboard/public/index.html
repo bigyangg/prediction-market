@@ -846,16 +846,20 @@
         <span id="trader-count" style="font-size:10px;color:var(--muted)">0 watching</span>
       </div>
       <div style="padding:10px">
-        <div id="traders-table-wrap" style="max-height:160px;overflow-y:auto;margin-bottom:10px;">
-          <table class="data-table" style="width:100%">
-            <thead>
-              <tr><th>Alias</th><th>Address</th><th>Positions</th><th>Trades</th></tr>
-            </thead>
-            <tbody id="traders-tbody">
-              <tr><td colspan="4" style="color:var(--muted);text-align:center;padding:12px">Loading…</td></tr>
-            </tbody>
-          </table>
+        <!-- Leaderboard Chart -->
+        <canvas id="leaderboard-chart" 
+          width="280" 
+          height="120"
+          style="width:280px;height:120px;display:block;margin-bottom:12px">
+        </canvas>
+        
+        <!-- Traders List -->
+        <div id="traders-list-wrap" style="max-height:200px;overflow-y:auto;margin-bottom:10px;">
+          <div id="traders-list">
+            <div style="color:var(--muted);text-align:center;padding:12px;font-size:11px">Loading…</div>
+          </div>
         </div>
+        
         <div style="display:flex;gap:6px;">
           <input id="trader-addr" type="text" placeholder="0x… wallet address" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:5px 8px;font-size:12px;" />
           <input id="trader-alias" type="text" placeholder="Alias" style="width:80px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:5px 8px;font-size:12px;" />
@@ -1316,21 +1320,105 @@ function escHtml(s) {
 
 function loadTraders() {
   fetch('/api/traders').then(r => r.json()).then(data => {
-    const tbody = el('traders-tbody');
+    const listDiv = el('traders-list');
     const count = el('trader-count');
     if (!data || !data.wallets) return;
     count.textContent = data.wallets.length + ' watching';
+    
     if (!data.wallets.length) {
-      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:12px">None yet — auto-discovery running</td></tr>';
+      listDiv.innerHTML = '<div style="color:var(--muted);text-align:center;padding:12px;font-size:11px">None yet — auto-discovery running</div>';
       return;
     }
-    tbody.innerHTML = data.wallets.map(w => `<tr>
-      <td style="font-weight:600">${escHtml(w.alias)}</td>
-      <td style="color:var(--muted);font-family:monospace">${escHtml(w.address)}</td>
-      <td style="text-align:center">${w.positions}</td>
-      <td style="text-align:center">${w.recentTrades}</td>
-    </tr>`).join('');
+    
+    // Render trader cards
+    listDiv.innerHTML = data.wallets.map(trader => {
+      const pnl = trader.pnl || 0;
+      const alias = escHtml(trader.alias || trader.address?.slice(0, 8) + '...');
+      const profileImg = trader.profileImage 
+        ? `<img src="${escHtml(trader.profileImage)}" style="width:28px;height:28px;border-radius:50%;flex-shrink:0">`
+        : `<div style="width:28px;height:28px;border-radius:50%;background:#334155;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0">${(trader.alias || '?')[0].toUpperCase()}</div>`;
+      
+      const xLink = trader.xUsername
+        ? `<a href="https://x.com/${escHtml(trader.xUsername)}" target="_blank" style="color:#64748b;font-size:10px;text-decoration:none;flex-shrink:0">𝕏</a>`
+        : '';
+      
+      return `<div style="display:flex;align-items:center;padding:8px;border-bottom:1px solid #1e293b;gap:10px;">
+        <div style="width:24px;height:24px;background:#1e293b;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;color:#64748b;flex-shrink:0">#${trader.rank || '?'}</div>
+        ${profileImg}
+        <div style="flex:1;min-width:0">
+          <div style="color:#e2e8f0;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${alias}</div>
+          <div style="color:#64748b;font-size:10px">
+            PnL: <span style="color:${pnl >= 0 ? '#22c55e' : '#ef4444'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(0)}</span>
+            · Vol: $${((trader.volume || 0) / 1000).toFixed(0)}k
+            · ${trader.positions || 0} pos
+          </div>
+        </div>
+        ${xLink}
+      </div>`;
+    }).join('');
+    
+    // Update leaderboard chart
+    updateLeaderboardChart(data.wallets);
   }).catch(() => {});
+}
+
+// Initialize leaderboard chart
+let leaderboardChart = null;
+function initLeaderboardChart() {
+  const lbCtx = el('leaderboard-chart');
+  if (!lbCtx) return;
+  leaderboardChart = new Chart(lbCtx, {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        backgroundColor: '#22c55e40',
+        borderColor: '#22c55e',
+        borderWidth: 1
+      }]
+    },
+    options: {
+      responsive: false,      // Disable auto-resize to fix looping bug
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { 
+          ticks: { color: '#64748b', font: { size: 9 } },
+          grid: { color: '#1e293b' }
+        },
+        y: { 
+          ticks: { 
+            color: '#64748b', 
+            font: { size: 9 },
+            callback: v => '$' + Math.abs(v).toFixed(0)
+          },
+          grid: { color: '#1e293b' }
+        }
+      }
+    }
+  });
+}
+
+function updateLeaderboardChart(wallets) {
+  if (!leaderboardChart) return;
+  const top5 = (wallets || [])
+    .sort((a, b) => (b.pnl || 0) - (a.pnl || 0))
+    .slice(0, 5);
+  
+  if (top5.length === 0) return;
+  
+  const newLabels = top5.map(t => (t.alias || '?').slice(0, 10));
+  const newData = top5.map(t => t.pnl || 0);
+  
+  // Only update if data changed to prevent constant re-renders
+  const currentLabels = leaderboardChart.data.labels.join(',');
+  if (currentLabels !== newLabels.join(',')) {
+    leaderboardChart.data.labels = newLabels;
+    leaderboardChart.data.datasets[0].data = newData;
+    leaderboardChart.update('none');  // 'none' = no animation on update
+  }
 }
 
 async function addTrader() {
@@ -1355,6 +1443,7 @@ async function addTrader() {
 }
 
 // Refresh trader table every 2 minutes
+initLeaderboardChart();  // Initialize chart first
 loadTraders();
 setInterval(loadTraders, 120000);
 

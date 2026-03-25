@@ -11,7 +11,39 @@ For setup, configuration, and full architecture documentation see the main [`REA
 
 ## What Has Changed Since the PDFs Were Written
 
-The PDFs describe the original v1.0 design. The current codebase reflects several significant additions:
+The PDFs describe the original v1.0 design. The current codebase reflects several significant additions and fixes:
+
+### v2.1 Critical Fixes (March 2026)
+
+**Order Placement Bug Fix**
+- Fixed critical issue where NO trades incorrectly used SELL instead of BUY
+- All new trades now properly BUY the correct token (YES=index 0, NO=index 1)
+- Impact: Ensures positions match agent intent
+
+**USDC Balance Conversion**
+- Fixed display of balance from micro-units (6 decimals) to dollars
+- Example: `103291356` now correctly displays as `$103.29`
+
+**Order Precision**
+- Added CLOB API-compliant decimal rounding (price: 2-3 decimals, size: 2 decimals)
+- Minimum order size validation (1 share)
+- Eliminates "maker amount supports max 4 decimals" errors
+
+**JSON Parsing Robustness**
+- Increased Sonnet max_tokens from 400 to 500
+- Enhanced extraction with line-by-line fallback for truncated responses
+
+**Sharp Traders UI**
+- Rich card layout with rank badges, profile images, PnL/volume stats
+- Interactive leaderboard bar chart (top 5 traders)
+- Full metadata from Polymarket API (profileImage, xUsername, verifiedBadge)
+- New `/api/leaderboard` endpoint
+
+**Sports Metadata**
+- SportsAgent now fetches resolution sources from `/sports` endpoint
+- Enriches analysis with official ordering and resolution data
+
+See [`CHANGELOG.md`](../CHANGELOG.md) for detailed fixes and migration notes.
 
 ### Gemini Validator (third model)
 

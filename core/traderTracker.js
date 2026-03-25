@@ -45,36 +45,50 @@ class TraderTracker {
 
   async fetchLeaderboard() {
     try {
-      const res = await axios.get(`${DATA_API}/leaderboard/profit`, {
-        params:  { window: 'weekly', limit: 20 },
+      const res = await axios.get(`${DATA_API}/v1/leaderboard`, {
+        params: {
+          category:   'OVERALL',
+          timePeriod: 'WEEK',
+          orderBy:    'PNL',
+          limit:      20
+        },
         timeout: 10000
       });
 
-      const traders = Array.isArray(res.data) ? res.data : [];
+      const traders = res.data || [];
       this.leaderboard = traders.map(t => ({
-        address: t.proxyWallet || t.address,
-        alias:   t.name || t.pseudonym || 'Trader',
-        pnl:     t.profit      || 0,
-        volume:  t.volume      || 0,
-        trades:  t.tradesCount || 0,
-        winRate: t.percentPnl  || 0
+        address:      t.proxyWallet,
+        alias:        t.userName || 'Trader #' + t.rank,
+        pnl:          t.pnl      || 0,
+        volume:       t.vol      || 0,
+        rank:         parseInt(t.rank) || 99,
+        profileImage: t.profileImage || null,
+        xUsername:    t.xUsername || null,
+        verifiedBadge: t.verifiedBadge || false
       })).filter(t => t.address);
 
-      // Auto-add top 5 to watch list — replace placeholder if still present
+      // Auto-add top 10 to watch list — replace placeholder if still present
       this.wallets = this.wallets.filter(w => !w.address.includes('000000'));
-      for (const trader of this.leaderboard.slice(0, 5)) {
+      const top10 = this.leaderboard.slice(0, 10);
+      for (const trader of top10) {
         if (!this.wallets.find(w => w.address === trader.address)) {
           this.wallets.push({
-            address:     trader.address,
-            alias:       trader.alias,
-            description: `Auto: $${(trader.pnl / 1000).toFixed(0)}k PnL this week`
+            address:       trader.address,
+            alias:         trader.alias,
+            pnl:           trader.pnl,
+            volume:        trader.volume,
+            rank:          trader.rank,
+            profileImage:  trader.profileImage,
+            xUsername:     trader.xUsername,
+            verifiedBadge: trader.verifiedBadge,
+            description:   `Rank #${trader.rank} | PnL: $${(trader.pnl||0).toFixed(0)}`
           });
         }
       }
 
-      logger.info('TraderTracker: leaderboard fetched', {
-        discovered: this.leaderboard.length,
-        watching:   this.wallets.length
+      logger.info('Leaderboard loaded', {
+        traders: this.leaderboard.length,
+        top:     this.leaderboard[0]?.alias
       });
     } catch (e) {
       logger.warn('TraderTracker: leaderboard unavailable — will retry in 5 min');
@@ -200,15 +214,21 @@ class TraderTracker {
       lastFetch:       this.lastFetch,
       wallets: this.wallets.map(w => ({
         alias:        w.alias,
-        address:      w.address.slice(0, 8) + '...',
+        address:      w.address,
+        pnl:          w.pnl || 0,
+        volume:       w.volume || 0,
+        rank:         w.rank || 99,
+        profileImage: w.profileImage || null,
+        xUsername:    w.xUsername || null,
+        verifiedBadge: w.verifiedBadge || false,
         positions:    (this.positions.get(w.address)    || []).length,
         recentTrades: (this.recentTrades.get(w.address) || []).length
       })),
       leaderboard: this.leaderboard.slice(0, 10).map(t => ({
         alias:   t.alias,
         pnl:     t.pnl,
-        trades:  t.trades,
-        winRate: t.winRate
+        rank:    t.rank,
+        volume:  t.volume
       }))
     };
   }

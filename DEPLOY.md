@@ -1,5 +1,7 @@
 # Railway Deployment
 
+> **Note**: This deployment guide is for Polybot v2.1+ which includes critical fixes for order placement, balance display, and CLOB API compliance. See [`CHANGELOG.md`](CHANGELOG.md) for details.
+
 ## Steps
 
 1. Push code to GitHub:

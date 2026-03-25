@@ -80,6 +80,16 @@ app.get('/api/traders', (_req, res) => {
   res.json(traderTracker.getSummary());
 });
 
+// GET /api/leaderboard — full leaderboard data
+app.get('/api/leaderboard', (_req, res) => {
+  const traderTracker = require('../core/traderTracker');
+  res.json({
+    leaderboard: traderTracker.leaderboard,
+    wallets:     traderTracker.wallets,
+    lastFetch:   traderTracker.lastFetch
+  });
+});
+
 // POST /api/traders/add — manually add a wallet to watch list
 app.post('/api/traders/add', (req, res) => {
   const { address, alias } = req.body;
