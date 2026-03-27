@@ -129,6 +129,35 @@ app.post('/api/trade/manual', (req, res) => {
   res.json({ ok: true, queued: payload });
 });
 
+// POST /api/agents/:name/toggle — start/stop individual agents
+app.post('/api/agents/:name/toggle', (req, res) => {
+  const { name } = req.params;
+  const agents = require('../index').getAgents?.() || [];
+  const agent = agents.find(a => a.name === name);
+
+  if (!agent) {
+    return res.status(404).json({ error: 'Agent not found: ' + name });
+  }
+
+  const isRunning = agent.active || agent.running;
+  if (isRunning) {
+    agent.stop();
+    logger.info('Dashboard: Agent toggled', { name, active: false });
+    res.json({ name, status: 'stopped', active: false });
+  } else {
+    agent.start();
+    logger.info('Dashboard: Agent toggled', { name, active: true });
+    res.json({ name, status: 'started', active: true });
+  }
+});
+
+// POST /api/supervisor/check — force a supervisor check
+app.post('/api/supervisor/check', async (req, res) => {
+  const supervisor = require('../core/supervisor');
+  const decision = await supervisor.check('manual trigger');
+  res.json({ decision, stats: supervisor.getStats() });
+});
+
 // ── HTTP Server ───────────────────────────────────────────────────────────────
 
 const httpServer = http.createServer(app);

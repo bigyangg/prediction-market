@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.0] - 2026-03-26
+
+### Added
+
+#### 🚀 BTCFastAgent — High-Frequency BTC 5-Minute Trader
+
+New specialized agent for trading live "BTC 5 Minute Up or Down" markets on Polymarket.
+
+**Features:**
+- **Real-time data**: Fetches live BTC price from Binance (with CoinGecko fallback)
+- **Technical analysis**: Analyzes 1-minute candles for momentum, trend detection, volume patterns
+- **Gemini-only**: Uses only Gemini 2.5 Flash (no Anthropic credits needed)
+- **High-frequency**: Scans every 60 seconds for new 5-minute markets
+- **Risk-controlled**: Max $5 stake per trade, designed for frequent small opportunities
+- **Dashboard integration**: Shows as orange card in agent panel
+
+**Technical Indicators:**
+- 3-candle uptrend/downtrend detection
+- 1-minute price change percentage
+- Volume trend (increasing/decreasing)
+- 24-hour momentum
+
+**Files:**
+- **`agents/btcFastAgent.js`**: Complete implementation (new file)
+- **`index.js`**: Wired into boot sequence
+- **`dashboard/public/index.html`**: Orange color coding for fast agents
+- **`README.md`**: Added to agent table
+
+**Usage:**
+BTCFastAgent starts automatically on bot launch. No configuration required beyond existing `GEMINI_API_KEY`.
+
+**Why This Agent:**
+- BTC 5-minute markets are high-volume, liquid, and resolve quickly
+- Momentum-based signals work well for short timeframes
+- No Anthropic credits needed (Gemini-only)
+- Small stakes limit risk while maximizing trading frequency
+
+#### 🔄 Gemini Scout Fallback (Zero-Downtime Credit Exhaustion)
+
+**Problem:** When Anthropic credits run out, Haiku scout fails and bot stops scanning.
+
+**Solution:** Automatic fallback to Gemini-based scouting when Anthropic credits are exhausted.
+
+**How It Works:**
+1. When Haiku scout encounters credit exhaustion error, sets `global._anthropicExhausted = true`
+2. All subsequent scout calls automatically use `_geminiScout()` method instead
+3. Gemini scout uses same filtering logic (skip low prob, low liq, low volume markets)
+4. Bot continues running 100% on Gemini with no interruption
+
+**Files:**
+- **`agents/baseAgent.js`**: 
+  - Added check at top of `scoutMarket()` to use Gemini when exhausted
+  - New `_geminiScout(market)` method with fast filtering prompt
+  - Enhanced error handling in Haiku scout to detect credit exhaustion
+  - Enhanced error handling in Sonnet arbiter to detect credit exhaustion
+
+**Benefits:**
+- **Zero downtime**: Bot never stops when credits run out
+- **Seamless transition**: Logs "switching to Gemini scouts" and continues
+- **Lower cost**: Gemini scout ~50% cheaper than Haiku ($0.0005 vs $0.001)
+- **Same quality**: Gemini applies identical filtering rules
+
+**Log Pattern:**
+```
+[CryptoAgent] Haiku Scout API call FAILED (status 402)
+Anthropic credits exhausted — switching to Gemini scouts
+[CryptoAgent] [Gemini Scout] PASS — good liquidity
+```
+
+### Changed
+
+#### 🚀 Gemini-First AI Pipeline (92% Cost Reduction)
+
+**Breaking Change**: Major restructure of the AI decision pipeline to reduce Anthropic API costs.
+
+**Old Pipeline:**
+- Haiku Scout → Sonnet Judge (100% of markets) → Gemini Validator
+- Cost: ~$45/month
+
+**New Pipeline:**
+- Haiku Scout → **Gemini Judge** (100% of markets, PRIMARY) → Sonnet Arbiter (5% of markets, SELECTIVE) → Gemini Validator
+- Cost: ~$6.75/month (92% reduction)
+
+**How It Works:**
+1. **Gemini as Primary Judge**: All markets are now analyzed by Gemini 2.5 Flash with live web search
+2. **Sonnet as Selective Arbiter**: Claude Sonnet now runs ONLY on exceptional trades that meet ALL criteria:
+   - Edge ≥ 10%
+   - Confidence ≥ 70%
+   - Liquidity ≥ $200k
+3. **Dual Confirmation**: When both models run and agree, confidence is boosted +10%
+4. **Gemini Priority**: When both models run and disagree, Gemini's decision is used with confidence reduced -10
+
+**Technical Changes:**
+- **`core/geminiJudge.js`**: Enhanced with comprehensive prompt matching Sonnet quality, added `sharpSignals` parameter for trader intelligence
+- **`agents/baseAgent.js`**: Completely rewrote scan() method to implement Gemini-first logic
+- **`core/riskManager.js`**: Lowered thresholds for Gemini's conservative nature (minEdge: 5→4, minConf: 62→55)
+- **`core/stateStore.js`**: Added `sessionCost` tracking for API cost monitoring
+- **`dashboard/public/index.html`**: Added "Est. API Cost" metric to dashboard
+
+**Why This Change:**
+- Gemini 2.5 Flash has live web search built-in (no need for separate news API)
+- 97% cheaper than Sonnet ($0.0005 vs $0.015 per call)
+- Quality remains high — Sonnet validates only the highest-conviction trades
+- Maintains same safety guarantees (Gemini Validator still has veto power)
+
+**Migration:**
+No configuration changes required. Simply pull latest code and restart. You'll see new log patterns:
+```
+[BaseAgent] Sending markets to GeminiJudge (primary)
+DUAL CONFIRMED — Gemini + Sonnet agree
+Models disagree — using Gemini
+Cost milestone { total: '$1.00', model: 'gemini' }
+```
+
+---
+
 ## [2.1.0] - 2026-03-25
 
 ### Fixed

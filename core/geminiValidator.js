@@ -3,12 +3,18 @@ require('dotenv').config();
 // @google/genai is ESM-only — loaded via dynamic import in init()
 const logger = require('./logger');
 
+// Helper to extract text from Gemini response (SDK returns nested structure)
+function extractText(response) {
+  return response?.candidates?.[0]?.content?.parts?.[0]?.text ||
+         response?.text ||
+         '';
+}
+
 // ── Validator prompt ──────────────────────────────────────────────────────────
 
 const VALIDATOR_PROMPT = (market, decision) =>
   `You are an independent quantitative risk validator for prediction markets.
-Another AI has proposed a trade. Use your web search capability to find
-current real-world information about this market before deciding.
+Review the proposed trade and validate the reasoning.
 
 PROPOSED TRADE:
 Market: "${market.question}"
@@ -143,7 +149,7 @@ class GeminiValidator {
         }
       });
 
-      const raw    = response.text;
+      const raw    = extractText(response);
       const parsed = this._extractJSON(raw);
 
       // Track whether Gemini actually searched

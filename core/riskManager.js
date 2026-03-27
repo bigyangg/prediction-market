@@ -40,8 +40,8 @@ class RiskManager {
     const absEdge = Math.abs(edge || 0);
 
     // Relaxed thresholds in simulation mode
-    const minEdge = this.simulationMode ? 2  : this.minEdge;
-    const minConf = this.simulationMode ? 40 : this.minConfidence;
+    const minEdge = this.simulationMode ? 2  : 4;   // was 5, lowered for Gemini-first
+    const minConf = this.simulationMode ? 40 : 55;  // was 62, lowered for Gemini-first
 
     // Log mode on first call
     if (!this._modeLogged) {

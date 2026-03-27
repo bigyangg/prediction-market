@@ -5,7 +5,14 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "pm2": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop polybot && pm2 delete polybot",
+    "pm2:logs": "pm2 logs polybot",
+    "pm2:monit": "pm2 monit",
+    "tunnel": "node start.js",
+    "tunnel:stop": "node start.js --stop",
+    "tunnel:local": "node start.js --no-tunnel"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.20.0",

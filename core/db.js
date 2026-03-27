@@ -26,12 +26,29 @@ async function bootstrap() {
     key: process.env.SUPABASE_ANON_KEY ? process.env.SUPABASE_ANON_KEY.slice(0, 20) + '...' : 'MISSING'
   });
 
-  try {
+  const connectionTest = async () => {
     const { data, error } = await supabase
       .from('trades')
       .select('count')
       .limit(1);
+    return { data, error };
+  };
 
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Supabase connection timeout')), 10000)
+  );
+
+  let testResult;
+  try {
+    testResult = await Promise.race([connectionTest(), timeoutPromise]);
+  } catch (e) {
+    logger.warn('Supabase connection failed — running without persistence', { error: e.message });
+    return false;
+  }
+
+  const { error } = testResult;
+
+  try {
     if (error && error.code === '42P01') {
       // Tables don't exist — log SQL for user to run
       logger.warn('Supabase tables not found. Run this SQL in your Supabase SQL editor:');
@@ -151,5 +168,6 @@ ALTER PUBLICATION supabase_realtime ADD TABLE daily_stats;
     return false;
   }
 }
-
 module.exports = { supabase, bootstrap };
+
+

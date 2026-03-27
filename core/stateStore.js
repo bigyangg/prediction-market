@@ -36,6 +36,9 @@ class StateStore extends EventEmitter {
     // News feed
     this.newsFeed = [];            // [{agent, text, type, ts}] — last 50 items
 
+    // Cost tracking (Gemini-first pipeline)
+    this.sessionCost = 0;          // estimated API cost this session
+
     // ── Real on-chain data (Data API) ──────────────────────────────────────
     this.realPnl = {
       totalCashPnl:      0,
@@ -223,6 +226,22 @@ class StateStore extends EventEmitter {
   // ── Snapshot for dashboard ─────────────────────────────────────────────────
 
   snapshot() {
+    // Safely require resilience modules (they might not be loaded during early boot)
+    let tradeSafetyStats = {};
+    let polymarketQueueStats = {};
+    
+    try {
+      tradeSafetyStats = require('./tradeSafety').getStats();
+    } catch (e) {
+      tradeSafetyStats = { error: 'not loaded' };
+    }
+    
+    try {
+      polymarketQueueStats = require('./polymarketQueue').getStats();
+    } catch (e) {
+      polymarketQueueStats = { error: 'not loaded' };
+    }
+    
     return {
       engineRunning: this.engineRunning,
       engineHalted: this.engineHalted,
@@ -243,7 +262,14 @@ class StateStore extends EventEmitter {
       realPnl:       this.realPnl,
       realPositions: this.realPositions,
       realTrades:    this.realTrades.slice(0, 50),
-      geminiJudge:   require('./geminiJudge').getStats()
+      geminiJudge:   require('./geminiJudge').getStats(),
+      aiQueue:       require('./aiQueue').getStats(),
+      sessionCost:   this.sessionCost || 0,
+      supervisor:    require('./supervisor').getStats(),
+      // Resilience stats
+      tradeSafety:     tradeSafetyStats,
+      polymarketQueue: polymarketQueueStats,
+      memoryUsage:     process.memoryUsage()
     };
   }
 }

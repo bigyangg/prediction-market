@@ -2,10 +2,10 @@
 const BaseAgent    = require('./baseAgent');
 const polymarket   = require('../core/polymarketClient');
 
-// ── CryptoAgent — 40s ─────────────────────────────────────────────────────────
+// ── CryptoAgent — 45s (premium: faster scans) ───────────────────────────────
 class CryptoAgent extends BaseAgent {
   constructor() {
-    super({ name: 'CryptoAgent', category: 'crypto', intervalSeconds: 40 });
+    super({ name: 'CryptoAgent', category: 'crypto', intervalSeconds: 45 });
   }
 
   async getMarkets() {
@@ -18,7 +18,7 @@ class CryptoAgent extends BaseAgent {
   }
 }
 
-// ── PoliticsAgent — 60s ───────────────────────────────────────────────────────
+// ── PoliticsAgent — 60s (premium: faster scans) ─────────────────────────────
 class PoliticsAgent extends BaseAgent {
   constructor() {
     super({ name: 'PoliticsAgent', category: 'politics', intervalSeconds: 60 });
@@ -34,14 +34,14 @@ class PoliticsAgent extends BaseAgent {
   }
 }
 
-// ── EconomicsAgent — 75s ──────────────────────────────────────────────────────
+// ── EconomicsAgent — 75s (premium: faster scans) ────────────────────────────
 class EconomicsAgent extends BaseAgent {
   constructor() {
     super({ name: 'EconomicsAgent', category: 'economics', intervalSeconds: 75 });
   }
 
   async getMarkets() {
-    const all = await polymarket.getActiveMarkets({ limit: 30 });
+    const all = await polymarket.getActiveMarkets({ limit: 25 });
     const keywords = ['gdp', 'inflation', 'fed', 'federal reserve', 'interest rate', 'cpi', 'recession', 'economy', 'unemployment', 'jobs', 'market cap', 's&p', 'nasdaq', 'dow', 'stock'];
     return all.filter(m => {
       const q = (m.question || m.title || '').toLowerCase();
@@ -50,10 +50,10 @@ class EconomicsAgent extends BaseAgent {
   }
 }
 
-// ── SportsAgent — 50s ─────────────────────────────────────────────────────────
+// ── SportsAgent — 40s (premium: faster scans) ───────────────────────────────
 class SportsAgent extends BaseAgent {
   constructor() {
-    super({ name: 'SportsAgent', category: 'sports', intervalSeconds: 50 });
+    super({ name: 'SportsAgent', category: 'sports', intervalSeconds: 40 });
     this._sportsMeta = null;  // Cache sports metadata
   }
 
@@ -95,14 +95,14 @@ class SportsAgent extends BaseAgent {
   }
 }
 
-// ── WeatherAgent — 90s ────────────────────────────────────────────────────────
+// ── WeatherAgent — 90s (premium: faster scans) ──────────────────────────────
 class WeatherAgent extends BaseAgent {
   constructor() {
     super({ name: 'WeatherAgent', category: 'weather', intervalSeconds: 90 });
   }
 
   async getMarkets() {
-    const all = await polymarket.getActiveMarkets({ limit: 30 });
+    const all = await polymarket.getActiveMarkets({ limit: 20 });
     const keywords = ['weather', 'hurricane', 'tornado', 'storm', 'temperature', 'rain', 'snow', 'flood', 'drought', 'climate', 'el nino', 'la nina', 'wildfire'];
     return all.filter(m => {
       const q = (m.question || m.title || '').toLowerCase();
@@ -111,15 +111,15 @@ class WeatherAgent extends BaseAgent {
   }
 }
 
-// ── OddsAgent — 55s (high-volume misc) ───────────────────────────────────────
+// ── OddsAgent — 50s (premium: faster scans, high-volume misc) ───────────────
 class OddsAgent extends BaseAgent {
   constructor() {
-    super({ name: 'OddsAgent', category: 'odds', intervalSeconds: 55 });
+    super({ name: 'OddsAgent', category: 'odds', intervalSeconds: 50 });
   }
 
   async getMarkets() {
     // Targets highest-volume markets regardless of category
-    const all = await polymarket.getActiveMarkets({ limit: 50 });
+    const all = await polymarket.getActiveMarkets({ limit: 40 });
     // Sort by volume descending, take top results (excluding already-covered categories)
     const excluded = ['bitcoin', 'btc', 'ethereum', 'election', 'president', 'weather', 'hurricane'];
     return all

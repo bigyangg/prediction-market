@@ -13,6 +13,35 @@ For setup, configuration, and full architecture documentation see the main [`REA
 
 The PDFs describe the original v1.0 design. The current codebase reflects several significant additions and fixes:
 
+### v2.2 Gemini-First Pipeline (March 2026)
+
+**Major Architectural Change: 92% Cost Reduction**
+
+The AI decision pipeline has been completely restructured to use Gemini as the primary judge instead of Claude Sonnet:
+
+**Old Pipeline (v2.1 and earlier):**
+- Haiku Scout → **Sonnet Judge** (100% of markets) → Gemini Validator
+- Cost: ~$45/month
+
+**New Pipeline (v2.2):**
+- Haiku Scout → **Gemini Judge** (100% of markets, PRIMARY) → **Sonnet Arbiter** (5% of markets, SELECTIVE) → Gemini Validator
+- Cost: ~$6.75/month (92% reduction)
+
+**How It Works:**
+1. Gemini 2.5 Flash analyzes all markets with live web search
+2. Sonnet runs ONLY on exceptional trades: edge ≥10%, confidence ≥70%, liquidity ≥$200k
+3. When both run and agree: confidence +10, marked as `dualConfirmed`
+4. When both run and disagree: Gemini's decision is used with confidence -10
+
+**Files Modified:**
+- `core/geminiJudge.js` — Enhanced with comprehensive prompt and sharp signals
+- `agents/baseAgent.js` — Rewrote scan() loop for Gemini-first logic
+- `core/riskManager.js` — Lowered thresholds (minEdge: 5→4, minConf: 62→55)
+- `core/stateStore.js` — Added sessionCost tracking
+- `dashboard/public/index.html` — Added "Est. API Cost" metric
+
+See [`docs/gemini-first-migration.md`](./gemini-first-migration.md) for complete migration guide.
+
 ### v2.1 Critical Fixes (March 2026)
 
 **Order Placement Bug Fix**

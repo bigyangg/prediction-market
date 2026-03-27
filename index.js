@@ -12,6 +12,7 @@ const { bootstrap }     = require('./core/db');
 const persistence       = require('./core/persistence');
 const geminiValidator   = require('./core/geminiValidator');
 const traderTracker     = require('./core/traderTracker');
+const supervisor        = require('./core/supervisor');
 const {
   CryptoAgent,
   PoliticsAgent,
@@ -20,18 +21,76 @@ const {
   WeatherAgent,
   OddsAgent
 } = require('./agents/specializedAgents');
+const btcFastAgent = require('./agents/btcFastAgent');
+
+// ── Resilience & Safety modules (NEW) ─────────────────────────────────────────
+const {
+  setupGlobalErrorHandlers,
+  MemoryMonitor,
+  Watchdog
+} = require('./core/resilience');
+const tradeSafety     = require('./core/tradeSafety');
+const polymarketQueue = require('./core/polymarketQueue');
 
 // ── Banner ────────────────────────────────────────────────────────────────────
 
 logger.info('╔════════════════════════════════════════╗');
-logger.info('║           POLYBOT v1.0                 ║');
+logger.info('║           POLYBOT v1.1                 ║');
 logger.info('║   Autonomous Polymarket Trading Engine ║');
+logger.info('║       (Resilience Edition)            ║');
 logger.info('╚════════════════════════════════════════╝');
+
+// ── Global variables for cleanup ──────────────────────────────────────────────
+let agents = [];
+let memoryMonitor = null;
+let watchdog = null;
+let dataPollInterval = null;
+let dailyStatsInterval = null;
 
 // ── Boot Sequence ─────────────────────────────────────────────────────────────
 
 async function boot() {
   try {
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 0: Install global error handlers (CRITICAL for 24/7 operation)
+    // ══════════════════════════════════════════════════════════════════════════
+    setupGlobalErrorHandlers({
+      onShutdown: async () => {
+        logger.info('[Boot] Running shutdown handler...');
+        await shutdown(agents);
+      }
+    });
+    logger.info('[Boot] Global error handlers installed ✓');
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 0b: Start memory monitor (detects leaks over 24-72h runs)
+    // ══════════════════════════════════════════════════════════════════════════
+    memoryMonitor = new MemoryMonitor({
+      warningThresholdMB: 400,
+      criticalThresholdMB: 700,
+      checkIntervalMs: 60000
+    });
+    logger.info('[Boot] Memory monitor started ✓');
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // STEP 0c: Start watchdog (restarts if bot freezes)
+    // ══════════════════════════════════════════════════════════════════════════
+    watchdog = new Watchdog({
+      checkIntervalMs: 60000,          // check every 1 min
+      staleThresholdMs: 10 * 60 * 1000, // 10 min without activity = stale
+      onStale: () => {
+        logger.warn('[Watchdog] Bot appears frozen - attempting recovery');
+        // Force restart all agents
+        for (const agent of agents) {
+          if (agent.running || agent.active) {
+            agent.stop();
+            setTimeout(() => agent.start(), 5000);
+          }
+        }
+      }
+    });
+    logger.info('[Boot] Watchdog started ✓');
+
     // 1. Wallet init (derives API creds, starts heartbeat, checks geoblock)
     logger.info('[Boot] Initializing wallet…');
     await polymarket.init();
@@ -101,28 +160,47 @@ async function boot() {
     logger.info('[Boot] Starting dashboard…');
     await startDashboard();
 
-    // 4. Instantiate all 6 agents
-    const agents = [
-      new CryptoAgent(),
+    // 4. Instantiate agents — only BTCFastAgent auto-starts; all others registered but stopped
+    const activeAgents = [];  // nothing else auto-starts — user controls via dashboard
+
+    const inactiveAgents = [
+      new OddsAgent(),
       new PoliticsAgent(),
-      new EconomicsAgent(),
+      new CryptoAgent(),
       new SportsAgent(),
-      new WeatherAgent(),
-      new OddsAgent()
+      new EconomicsAgent(),
+      new WeatherAgent()
     ];
+
+    // All agents (including btcFastAgent) exported for dashboard control
+    agents = [btcFastAgent, ...activeAgents, ...inactiveAgents];
 
     // 4b. Init sharp trader tracking
     logger.info('[Boot] Starting TraderTracker…');
     await traderTracker.init();
     traderTracker.start();
 
-    // 5. Start agents staggered 3s apart
-    logger.info('[Boot] Starting agents with 3s stagger…');
-    for (let i = 0; i < agents.length; i++) {
-      const agent = agents[i];
-      const staggerMs = i * 3000; // 3 seconds between each agent
-      agent.start(staggerMs);
-      logger.info(`[Boot] Agent queued: ${agent.name} (starts in ${staggerMs / 1000}s)`);
+    // 4c. Start BTCFastAgent
+    logger.info('[Boot] Starting BTCFastAgent…');
+    btcFastAgent.start();
+
+    // 4d. Start Supervisor (20-min periodic reviews)
+    logger.info('[Boot] Starting Supervisor…');
+    supervisor.start();
+    logger.info('Supervisor: active — checking every 20 min, max 20 calls/day');
+
+    // 5. No other agents auto-start — BTCFastAgent is the only active agent at boot
+
+    // Register inactive agents in stateStore so dashboard shows them as stopped
+    for (const agent of inactiveAgents) {
+      stateStore.updateAgent?.(agent.name, {
+        active:   false,
+        status:   'stopped',
+        category: agent.category,
+        interval: agent.intervalSeconds + 's',
+        scans:    0
+      });
+      logger.info(`[Boot] Agent registered (inactive): ${agent.name}`);
     }
 
     // 6. Manual trade handler
@@ -149,6 +227,9 @@ async function boot() {
     // 6b. Data API polling — real on-chain positions/trades/PnL every 30s
     const pollDataAPI = async () => {
       try {
+        // Signal watchdog that we're alive
+        if (watchdog) watchdog.heartbeat('data-poll');
+        
         const [pnlData, trades] = await Promise.all([
           polymarket.getRealPnL(),
           polymarket.getRealTrades(30)
@@ -157,6 +238,10 @@ async function boot() {
         stateStore.setRealPositions(pnlData.positions);
         stateStore.setRealTrades(trades);
         stateStore.pushPnl(pnlData.totalCashPnl); // feeds P&L chart with real data
+        
+        // Sync positions to tradeSafety for limit tracking
+        tradeSafety.syncPositions(pnlData.positions || []);
+        
         const bal = await polymarket.getUSDCBalance();
         stateStore.setWallet(
           process.env.POLYMARKET_FUNDER_ADDRESS || polymarket.wallet?.address,
@@ -168,7 +253,7 @@ async function boot() {
       }
     };
     pollDataAPI(); // immediate first call
-    const dataPollInterval = setInterval(pollDataAPI, 30000);
+    dataPollInterval = setInterval(pollDataAPI, 30000);
     // Instant re-poll on confirmed on-chain trade (from user WebSocket)
     stateStore.on('trigger_data_poll', () => {
       logger.info('[DataAPI] Instant re-poll triggered by on-chain trade confirmation');
@@ -176,7 +261,7 @@ async function boot() {
     });
 
     // 7. Daily stats sync to Supabase every 60s
-    setInterval(() => {
+    dailyStatsInterval = setInterval(() => {
       const stats = riskManager.getStats();
       persistence.updateDailyStats({
         totalPnl:       stats.totalPnl,
@@ -200,8 +285,11 @@ async function boot() {
       }
     }, { timezone: 'UTC' });
 
-    // 9. Watchdog — auto-restart engine if stopped by API failure (not manual/halt)
+    // 9. Enhanced Watchdog — auto-restart engine if stopped by API failure (not manual/halt)
     setInterval(() => {
+      // Signal watchdog on every check
+      if (watchdog) watchdog.heartbeat('watchdog-check');
+      
       if (!stateStore.engineRunning && !stateStore.engineHalted) {
         logger.info('[Watchdog] Engine was stopped (not halted) — auto-restarting');
         stateStore.setEngineRunning(true);
@@ -212,9 +300,18 @@ async function boot() {
 
     // ── Print agent summary ────────────────────────────────────────────────
     logger.info('══════════════════════════════════════════');
+    logger.info('  RESILIENCE SYSTEMS:');
+    logger.info('  ✓ Global error handlers (uncaughtException, unhandledRejection)');
+    logger.info('  ✓ Memory monitor (leak detection, GC triggers)');
+    logger.info('  ✓ Watchdog (freeze detection, auto-recovery)');
+    logger.info('  ✓ Trade safety (dedup, cooldowns, position limits)');
+    logger.info('  ✓ API rate limiting (circuit breaker, retry backoff)');
+    logger.info('══════════════════════════════════════════');
     logger.info('  ALL AGENTS INITIALIZED:');
     for (const agent of agents) {
-      logger.info(`  ✓ ${agent.name.padEnd(18)} category=${agent.category.padEnd(10)} interval=${agent.intervalSeconds}s`);
+      const ivl = agent.intervalSeconds ?? (agent.scanInterval ? agent.scanInterval / 1000 : '?');
+      const isActive = agent.active || agent.running;
+      logger.info(`  ${isActive ? '✓' : '○'} ${agent.name.padEnd(18)} category=${agent.category.padEnd(10)} interval=${ivl}s${isActive ? '' : ' [stopped]'}`);
     }
     const dashPort = parseInt(process.env.PORT) || parseInt(process.env.HTTP_PORT) || 3000;
     logger.info(`  Dashboard: http://localhost:${dashPort}`);
@@ -222,9 +319,10 @@ async function boot() {
     logger.info(`  Mode:      ${stateStore.readOnly ? 'READ-ONLY (simulation)' : 'LIVE TRADING'}`);
     logger.info('══════════════════════════════════════════');
 
-    // 8. Graceful shutdown
-    process.on('SIGINT', () => shutdown(agents));
-    process.on('SIGTERM', () => shutdown(agents));
+    // Note: SIGINT/SIGTERM handlers are now set up by setupGlobalErrorHandlers
+    
+    // Export ALL agents (active + inactive) for dashboard control
+    module.exports.getAgents = () => agents;
 
   } catch (err) {
     logger.error(`[Boot] Fatal error: ${err.message}`);
@@ -233,14 +331,27 @@ async function boot() {
   }
 }
 
-function shutdown(agents) {
+async function shutdown(agentsToStop) {
   logger.info('[Shutdown] Stopping all agents…');
-  for (const agent of agents) {
-    agent.stop();
+  for (const agent of agentsToStop) {
+    try {
+      agent.stop();
+    } catch (e) {
+      logger.warn(`[Shutdown] Error stopping agent ${agent.name}:`, e.message);
+    }
   }
+  
+  // Clear intervals
+  if (dataPollInterval) clearInterval(dataPollInterval);
+  if (dailyStatsInterval) clearInterval(dailyStatsInterval);
+  
+  // Cleanup resilience systems
+  if (memoryMonitor) memoryMonitor.destroy();
+  if (watchdog) watchdog.destroy();
+  tradeSafety.destroy();
+  
   stateStore.setEngineRunning(false);
   logger.info('[Shutdown] Polybot stopped. Goodbye.');
-  setTimeout(() => process.exit(0), 1000);
 }
 
 boot();

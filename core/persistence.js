@@ -140,6 +140,7 @@ async function getCachedMarkets(maxAgeMinutes = 10) {
       bestAsk:         m.best_ask,
       bestBid:         m.best_bid,
       tokenIds:        m.token_ids || [],
+      clobTokenIds:    m.token_ids || [],  // Add this for btcFastAgent
       tokens:          (m.token_ids || []).map((id, i) => ({ token_id: id, outcome: i === 0 ? 'Yes' : 'No' })),
       negRisk:         m.neg_risk,
       minimumTickSize: m.min_tick || '0.01',

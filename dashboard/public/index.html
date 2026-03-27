@@ -671,7 +671,7 @@
   <!-- LEFT COLUMN -->
   <div class="left">
 
-    <!-- Stats row -->
+    <!-- Stats row - consolidated -->
     <div class="stats-row">
       <div class="stat-cell">
         <div class="s-label">Total P&amp;L <span style="color:var(--green);font-size:8px">(chain)</span></div>
@@ -681,6 +681,7 @@
       <div class="stat-cell">
         <div class="s-label">Daily P&amp;L</div>
         <div class="s-value" id="daily-pnl">$0.00</div>
+        <div class="s-sub" id="loss-pct-sub">0% of limit</div>
       </div>
       <div class="stat-cell">
         <div class="s-label">Positions</div>
@@ -696,31 +697,35 @@
         <div class="s-value" id="scans">0</div>
       </div>
       <div class="stat-cell">
-        <div class="s-label">Loss Limit</div>
-        <div class="s-value" id="loss-pct">0%</div>
-      </div>
-      <div class="stat-cell">
-        <div class="s-label">Gemini Judge</div>
-        <div class="s-value" id="gemini-skip-rate">—%</div>
-        <div class="s-sub" id="gemini-calls">0 analyzed</div>
+        <div class="s-label">API Cost</div>
+        <div class="s-value" id="session-cost">$0.00</div>
+        <div class="s-sub" id="gemini-calls">0 AI calls</div>
       </div>
     </div>
 
     <!-- Loss limit bar -->
     <div class="loss-row">
-      <div class="l-label">Daily Loss Usage</div>
+      <div class="l-label">Daily Loss</div>
       <div class="loss-bar-track">
         <div id="loss-bar" style="width:0%"></div>
       </div>
       <span id="loss-bar-label">$0 / $50</span>
     </div>
 
-    <!-- Engine controls -->
-    <div class="controls-row">
-      <span class="controls-label">Engine</span>
-      <button class="btn stop"  onclick="engineStop()">Stop</button>
-      <button class="btn start" onclick="engineStart()">Start</button>
-      <button class="btn reset" onclick="resetDaily()">Reset Daily</button>
+    <!-- Engine controls + System Health combined -->
+    <div class="controls-row" style="justify-content:space-between;">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span class="controls-label">Engine</span>
+        <button class="btn stop"  onclick="engineStop()">Stop</button>
+        <button class="btn start" onclick="engineStart()">Start</button>
+        <button class="btn reset" onclick="resetDaily()">Reset Daily</button>
+      </div>
+      <div id="system-health" style="display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:10px;color:var(--muted);">
+        <span title="Memory usage">MEM: <span id="health-mem" style="color:var(--green)">—</span></span>
+        <span title="API queue depth">API: <span id="health-api" style="color:var(--green)">0</span></span>
+        <span title="Pending orders">ORD: <span id="health-orders" style="color:var(--green)">0</span></span>
+        <span title="Circuit breaker state">CB: <span id="health-cb" style="color:var(--green)">OK</span></span>
+      </div>
     </div>
 
     <!-- P&L Chart -->
@@ -826,6 +831,37 @@
 
   <!-- RIGHT COLUMN -->
   <div class="right">
+
+    <!-- Supervisor Panel -->
+    <div class="panel" id="supervisor-panel" style="background:#0f0f1a;border:1px solid #1e293b;">
+      <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center;">
+        <span class="ph-title">Supervisor</span>
+        <span id="sv-calls" style="font-size:10px;color:var(--muted)">0/20 calls</span>
+      </div>
+      <div style="padding:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div>
+            <span id="sv-status" style="font-size:13px;font-weight:700;color:var(--green)">CONTINUE</span>
+            <span id="sv-risk" style="color:var(--muted);font-size:10px;margin-left:8px">Risk: KEEP</span>
+          </div>
+          <div style="color:var(--muted);font-size:10px">
+            Conf: <span id="sv-conf">75</span>%
+          </div>
+        </div>
+        <div style="color:var(--muted);font-size:10px;margin-bottom:8px">
+          Total checks: <span id="sv-check-count">0</span>
+        </div>
+        <button onclick="forceSupervisorCheck()" style="
+          padding:4px 12px;
+          font-size:10px;
+          border-radius:4px;
+          cursor:pointer;
+          border:1px solid #6366f1;
+          background:rgba(99,102,241,0.1);
+          color:#6366f1;
+        ">Force Check Now</button>
+      </div>
+    </div>
 
     <!-- Signal Feed -->
     <div class="panel">
@@ -1011,6 +1047,50 @@ function renderAll(s) {
   renderPositions();
   renderRealTrades();
   renderTFPill();
+  renderSupervisor();
+}
+
+function renderSupervisor() {
+  const sv = state.supervisor;
+  if (!sv) return;
+  
+  const statusEl = el('sv-status');
+  const riskEl = el('sv-risk');
+  const confEl = el('sv-conf');
+  const callsEl = el('sv-calls');
+  const checkCountEl = el('sv-check-count');
+  
+  if (statusEl) {
+    statusEl.textContent = sv.status || 'CONTINUE';
+    statusEl.style.color = sv.status === 'PAUSE' ? 'var(--red)' : 'var(--green)';
+  }
+  if (riskEl) {
+    riskEl.textContent = 'Risk: ' + (sv.risk || 'KEEP');
+  }
+  if (confEl) {
+    confEl.textContent = sv.confidence || 75;
+  }
+  if (callsEl) {
+    callsEl.textContent = (sv.callsToday || 0) + '/20 calls';
+  }
+  if (checkCountEl) {
+    checkCountEl.textContent = sv.checkCount || 0;
+  }
+}
+
+async function forceSupervisorCheck() {
+  try {
+    const res = await fetch('/api/supervisor/check', { method: 'POST' });
+    const data = await res.json();
+    console.log('Supervisor check result:', data);
+    // Update state with new supervisor stats
+    if (data.stats) {
+      state.supervisor = data.stats;
+      renderSupervisor();
+    }
+  } catch (e) {
+    console.error('Supervisor check failed:', e);
+  }
 }
 
 function renderTFPill() {
@@ -1048,15 +1128,63 @@ function renderStats() {
   el('win-rate').textContent  = wr + '%';
   el('win-rate').className    = 's-value ' + (wr >= 50 ? 'green' : 'red');
   el('scans').textContent     = s.scansCompleted || 0;
+  el('session-cost').textContent = '$' + (s.sessionCost || 0).toFixed(2);
+  
+  // Loss limit
   const lp = s.riskStats ? s.riskStats.dailyLossUsedPct : 0;
-  el('loss-pct').textContent  = (lp || 0) + '%';
-  el('loss-pct').className    = 's-value ' + (lp > 75 ? 'red' : lp > 50 ? 'yellow' : 'green');
-  const gj = s.geminiJudge;
-  if (gj) {
-    el('gemini-skip-rate').textContent = gj.skipRate + '% skip';
-    el('gemini-calls').textContent     = (gj.calls || 0) + ' analyzed';
+  const lpSub = el('loss-pct-sub');
+  if (lpSub) {
+    lpSub.textContent = (lp || 0) + '% of limit';
+    lpSub.style.color = lp > 75 ? 'var(--red)' : lp > 50 ? 'var(--yellow)' : 'var(--muted)';
   }
+  
+  // AI calls count
+  const gj = s.geminiJudge;
+  const aiQ = s.aiQueue;
+  if (gj || aiQ) {
+    const totalCalls = (gj?.calls || 0) + (aiQ?.calls || 0);
+    el('gemini-calls').textContent = totalCalls + ' AI calls';
+  }
+  
+  // System health indicators
+  renderSystemHealth(s);
+  
   renderLossBar();
+}
+
+function renderSystemHealth(s) {
+  // Memory - from process.memoryUsage via snapshot
+  const memEl = el('health-mem');
+  if (memEl && s.memoryUsage) {
+    const heapMB = Math.round(s.memoryUsage.heapUsed / 1024 / 1024);
+    memEl.textContent = heapMB + 'MB';
+    memEl.style.color = heapMB > 500 ? 'var(--red)' : heapMB > 300 ? 'var(--yellow)' : 'var(--green)';
+  }
+  
+  // API queue depth
+  const apiEl = el('health-api');
+  if (apiEl && s.polymarketQueue) {
+    const tq = s.polymarketQueue.tradeQueue || {};
+    const queued = (tq.queued || 0) + (tq.running || 0);
+    apiEl.textContent = queued;
+    apiEl.style.color = queued > 10 ? 'var(--yellow)' : 'var(--green)';
+  }
+  
+  // Pending orders
+  const ordEl = el('health-orders');
+  if (ordEl && s.tradeSafety) {
+    const pending = s.tradeSafety.pendingOrders || 0;
+    ordEl.textContent = pending;
+    ordEl.style.color = pending > 5 ? 'var(--yellow)' : 'var(--green)';
+  }
+  
+  // Circuit breaker
+  const cbEl = el('health-cb');
+  if (cbEl && s.polymarketQueue?.circuitBreaker) {
+    const cb = s.polymarketQueue.circuitBreaker;
+    cbEl.textContent = cb.state || 'OK';
+    cbEl.style.color = cb.state === 'OPEN' ? 'var(--red)' : cb.state === 'HALF' ? 'var(--yellow)' : 'var(--green)';
+  }
 }
 
 function renderPositions() {
@@ -1206,12 +1334,35 @@ function renderAgents() {
     const approved = a.approvedCount || 0;
     const filtered = a.filteredCount || 0;
     const filterRate = scouted > 0 ? Math.round((filtered / scouted) * 100) : 0;
-    return `<div class="agent-card ${statusClass}">
-      <div class="agent-header">
-        <div class="agent-dot"></div>
-        <div class="agent-name">${escHtml(a.name || name)}</div>
+    
+    // Special color for BTCFastAgent
+    const isFastAgent = name.includes('Fast');
+    const borderColor = isFastAgent ? '#f97316' : ''; // orange for fast trading
+    const borderStyle = borderColor ? `border-left-color: ${borderColor} !important;` : '';
+    const isActive = a.active !== false;
+    
+    return `<div class="agent-card ${statusClass}" style="${borderStyle}">
+      <div class="agent-header" style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;">
+          <div class="agent-dot" style="${borderColor ? `background: ${borderColor};` : isActive ? '' : 'background: #64748b;'}"></div>
+          <div class="agent-name">${escHtml(a.name || name)}</div>
+        </div>
+        <button 
+          onclick="toggleAgent('${name}')"
+          style="
+            padding:2px 8px;
+            font-size:10px;
+            border-radius:4px;
+            cursor:pointer;
+            border: 1px solid ${isActive ? '#ef4444' : '#22c55e'};
+            background: ${isActive ? '#ef444420' : '#22c55e20'};
+            color: ${isActive ? '#ef4444' : '#22c55e'};
+            font-weight:600;
+          ">
+          ${isActive ? 'Stop' : 'Start'}
+        </button>
       </div>
-      <div class="agent-meta">${escHtml((a.category || '').toUpperCase())} &middot; ${a.intervalSeconds || '?'}s &middot; Scans: ${a.scans || 0}</div>
+      <div class="agent-meta">${escHtml((a.category || '').toUpperCase())} &middot; ${a.interval || a.intervalSeconds + 's' || '?'} &middot; Scans: ${a.scans || 0}</div>
       <div class="agent-meta">Last: ${a.lastScan ? new Date(a.lastScan).toLocaleTimeString() : '—'}</div>
       <div class="scout-row">
         <div class="scout-item scv"><span class="sv">${scouted}</span> Scout</div>
@@ -1280,6 +1431,20 @@ async function engineStart() {
 }
 async function resetDaily() {
   await api('POST', '/api/risk/reset-daily');
+}
+
+async function toggleAgent(name) {
+  try {
+    const res = await api('POST', `/api/agents/${name}/toggle`);
+    if (res && res.error) {
+      console.error('Toggle agent failed:', res.error);
+    } else {
+      console.log('Agent toggled:', res);
+    }
+    // Dashboard will update automatically via WebSocket
+  } catch(e) {
+    console.error('Toggle agent error:', e);
+  }
 }
 
 async function submitManualTrade() {

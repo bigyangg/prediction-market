@@ -271,17 +271,9 @@ class PolymarketClient {
 
     await this.ensureAllowance();
 
-    // Step 6 — Heartbeat (CRITICAL — keeps WS session alive)
-    let heartbeatId = '';
-    setInterval(async () => {
-      try {
-        const resp = await this.client.postHeartbeat(heartbeatId);
-        heartbeatId = resp?.heartbeat_id || heartbeatId;
-      } catch (e) {
-        logger.warn('[PolymarketClient] Heartbeat failed — retrying next interval', { error: e.message });
-      }
-    }, 5000);
-    logger.info('[PolymarketClient.init] Heartbeat started (5s interval)');
+    // Step 6 — Heartbeat (disabled - only needed for limit orders)
+    // Market orders execute immediately, no heartbeat required
+    logger.info('[PolymarketClient.init] Heartbeat disabled (using market orders)');
 
     // Step 7 — User WebSocket for instant trade confirmation
     this.connectUserWebSocket();
@@ -591,19 +583,25 @@ class PolymarketClient {
         market: (marketQuestion || '').slice(0, 50)
       });
 
-      // Step 4 — Create order with rounded values
+      // Step 4 — Create order arguments
       const clobSide = side === 'BUY' ? this.Side.BUY : this.Side.SELL;
-      const marketOrder = {
+      const orderArgs = {
         tokenID: tokenId,
         price: roundedPrice,
         size: roundedSize,
         side: clobSide
       };
 
-      // Step 5 — Place GTC limit order (stays open until filled)
-      const resp = await this.client.createAndPostMarketOrder(
-        marketOrder,
-        { tickSize, negRisk },
+      // Step 5 — Create and post GTC limit order (two-step process)
+      // createOrder() signs the order locally
+      // postOrder() submits to CLOB as limit order (GTC = Good Till Cancelled)
+      const signedOrder = await this.client.createOrder(
+        orderArgs,
+        { tickSize, negRisk }
+      );
+      
+      const resp = await this.client.postOrder(
+        signedOrder,
         this.OrderType.GTC
       );
 

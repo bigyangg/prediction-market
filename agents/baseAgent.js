@@ -1,15 +1,19 @@
 'use strict';
 // ─────────────────────────────────────────────────────────────────────────────
-// COST MODEL (Three-Model Architecture):
+// COST MODEL (Gemini-First Three-Model Architecture):
 //
-// Layer 1 — Haiku scout:    ~$0.001/market × N markets per scan
-// Layer 2 — Gemini judge:   ~$0.0005/market × scout-approved markets (NEW)
-// Layer 3 — Sonnet arbiter: ~$0.015/market × only high-conviction + big markets
+// Layer 1 — Haiku scout:    ~$0.001/market × N markets per scan (100% of markets)
+// Layer 2 — Gemini judge:   ~$0.0005/market × scout-approved markets (100% - PRIMARY)
+// Layer 3 — Sonnet arbiter: ~$0.015/market × exceptional only (5% - SELECTIVE)
+//           Only runs when: edge ≥10%, conf ≥70%, liq ≥$200k
 //
-// Estimated per scan: $0.01 scout + $0.05 Gemini + rare Sonnet ≈ $0.001 avg
-// vs old two-model:   $0.01 scout + $0.03–0.05 Sonnet (94% reduction on judge)
+// Estimated daily cost (6 agents, 100 markets/day):
+//   Haiku:  100 calls × $0.001  = $0.10
+//   Gemini: 100 calls × $0.0005 = $0.05
+//   Sonnet: 5 calls   × $0.015  = $0.075
+//   Total: ~$0.225/day = ~$6.75/month
 //
-// With $10 Anthropic credit: Sonnet only fires on edge≥6%, conf≥60%, liq≥$500k
+// vs v2.1 Sonnet-first: ~$45/month (92% reduction)
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const Anthropic   = require('@anthropic-ai/sdk');
@@ -22,6 +26,7 @@ const persistence       = require('../core/persistence');
 const geminiValidator   = require('../core/geminiValidator');
 const geminiJudge       = require('../core/geminiJudge');
 const traderTracker     = require('../core/traderTracker');
+const aiQueue           = require('../core/aiQueue');
 
 // ── Model config — read from env with exact fallbacks ─────────────────────────
 const SCOUT_MODEL = process.env.SCOUT_MODEL || 'claude-haiku-4-5-20251001';
@@ -101,6 +106,7 @@ class BaseAgent {
     this.category        = category;
     this.intervalSeconds = intervalSeconds;
     this.running         = false;
+    this.active          = false;  // exposed for dashboard toggle
     this._timer          = null;
     this._client         = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -122,6 +128,7 @@ class BaseAgent {
       name,
       category,
       status:        'idle',
+      active:        false,
       scans:         0,
       lastScan:      null,
       intervalSeconds,
@@ -139,6 +146,8 @@ class BaseAgent {
       return;
     }
     this.running = true;
+    this.active  = true;
+    stateStore.updateAgent(this.name, { active: true });
     const jitter = staggerMs >= 0 ? staggerMs : Math.floor(Math.random() * 10000);
     logger.info(`[${this.name}] Scheduled start in ${(jitter / 1000).toFixed(1)}s`, {
       category: this.category, intervalSeconds: this.intervalSeconds
@@ -147,7 +156,7 @@ class BaseAgent {
     await new Promise(r => setTimeout(r, jitter));
     if (!this.running) return;
 
-    stateStore.updateAgent(this.name, { status: 'running' });
+    stateStore.updateAgent(this.name, { status: 'running', active: true });
     logger.info(`[${this.name}] Active — scanning every ${this.intervalSeconds}s`);
     this._scheduleNext();
   }
@@ -155,8 +164,9 @@ class BaseAgent {
   stop() {
     if (!this.running) return;
     this.running = false;
+    this.active  = false;
     if (this._timer) { clearTimeout(this._timer); this._timer = null; }
-    stateStore.updateAgent(this.name, { status: 'stopped' });
+    stateStore.updateAgent(this.name, { status: 'stopped', active: false });
     logger.info(`[${this.name}] Stopped`);
   }
 
@@ -215,18 +225,15 @@ class BaseAgent {
       return;
     }
 
-    logger.info(`[${this.name}] [${scanId}] Scouting ${markets.length} markets with Haiku`, {
-      scoutModel: SCOUT_MODEL
-    });
+    logger.info(`[${this.name}] [${scanId}] Rule-scouting ${markets.length} markets`);
 
-    // ── Phase 1: Haiku scouts all markets (500ms between calls) ─────────────
+    // ── Phase 1: Rule-based scout — instant, zero API calls ─────────────────
     const approved = [];
     for (let i = 0; i < markets.length; i++) {
       if (!stateStore.engineRunning || stateStore.engineHalted) {
         logger.info(`[${this.name}] Scout loop aborted — engine stopped/halted`);
         break;
       }
-      if (i > 0) await delay(500); // 500ms between Haiku calls
 
       const market = markets[i];
       const worthAnalyzing = await this.scoutMarket(market, scanId);
@@ -253,170 +260,152 @@ class BaseAgent {
     });
 
     if (!approved.length) {
-      logger.info(`[${this.name}] [${scanId}] All markets filtered by Haiku — no Sonnet calls needed`);
+      logger.info(`[${this.name}] [${scanId}] All markets filtered by rules — no AI calls needed`);
       return;
     }
 
     // ── Phase 2: Fetch news context once (cached 60s) ────────────────────────
     const newsCtx = await newsFetcher.getContextForCategory(this.category);
 
-    // ── Phase 3: Gemini judges first; Sonnet only for high-conviction + big markets ─
-    logger.info(`[${this.name}] [${scanId}] Sending ${approved_} approved markets to GeminiJudge`, {
+    // ── Phase 3: LIMIT approved markets to top 3 by liquidity (hard cap) ────────
+    // With premium Gemini API — allow more markets per scan
+    const judgeTargets = approved
+      .sort((a, b) => (b.liquidity || 0) - (a.liquidity || 0))
+      .slice(0, 8);  // Premium: up to 8 markets to Gemini per scan
+    
+    if (judgeTargets.length < approved.length) {
+      logger.info(`[${this.name}] [${scanId}] Hard cap applied — judging top 8 of ${approved.length} by liquidity`, {
+        judging: judgeTargets.length,
+        skipped: approved.length - judgeTargets.length
+      });
+    }
+
+    // ── Phase 4: Gemini judges first; Sonnet only for high-conviction + big markets ─
+    logger.info(`[${this.name}] [${scanId}] Sending ${judgeTargets.length} approved markets to GeminiJudge`, {
       geminiModel: geminiJudge.modelName,
       judgeModel:  JUDGE_MODEL
     });
 
-    for (const market of approved) {
+    for (const market of judgeTargets) {
       if (!stateStore.engineRunning || stateStore.engineHalted) {
         logger.info(`[${this.name}] Judge loop aborted — engine stopped/halted`);
         break;
       }
       await delay(1500);
 
-      // Step 1: Try Gemini first (cheap — $0.30/$2.50 per 1M tokens)
-      let decision    = await geminiJudge.analyze(market, newsCtx);
-      let usedSonnet  = false;
+      // Sharp trader signals for this market
+      const sharpSignals = traderTracker.getSignalForMarket(
+        market.question,
+        market.conditionId || market.id
+      );
 
-      if (!decision) {
-        // Gemini unavailable — fall back to full Sonnet path
-        await this.analyzeMarket(market, newsCtx, scanId);
-        continue;
+      // Step 1: Try Gemini FIRST (primary judge)
+      let decision = null;
+      let usedSonnet = false;
+      
+      if (geminiJudge.isAvailable()) {
+        decision = await geminiJudge.analyze(market, newsCtx, sharpSignals);
       }
-
-      decision.market_probability = market.marketProb ?? this._getMarketProbability(market);
-
-      if (
+      
+      // Step 2: Only call Sonnet if Gemini found exceptional edge
+      // OR if Gemini is unavailable
+      const geminiFoundBigEdge = decision && 
         decision.trade !== 'SKIP' &&
-        Math.abs(decision.edge || 0) >= 6 &&
-        decision.confidence >= 60 &&
-        (market.liquidity || 0) >= 500000  // only big markets worth Sonnet's cost
-      ) {
-        // High conviction Gemini signal — get Sonnet's second opinion
-        logger.info('High conviction — requesting Sonnet arbiter', {
-          geminiEdge: decision.edge,
-          geminiConf: decision.confidence,
-          market:     market.question?.slice(0, 50)
-        });
+        Math.abs(decision.edge || 0) >= 10 &&
+        (decision.confidence || 0) >= 70 &&
+        (market.liquidity || 0) >= 200000;
+      
+      if (!decision || geminiFoundBigEdge) {
         const sonnetDecision = await this._callSonnet(market, newsCtx, scanId);
         usedSonnet = true;
-
-        if (sonnetDecision) {
+        
+        if (!decision) {
+          // Gemini unavailable — use Sonnet alone
+          decision = sonnetDecision;
+          if (decision) {
+            decision._model = 'sonnet';
+            decision._dualConfirmed = false;
+          }
+        } else if (geminiFoundBigEdge && sonnetDecision) {
+          // Both ran — require agreement for high confidence
           if (sonnetDecision.trade === decision.trade) {
-            // Both agree — high confidence trade
-            decision = sonnetDecision;
-            decision.dualConfirmed = true;
-            logger.info('DUAL CONFIRMED — Gemini + Sonnet agree', {
+            decision.confidence = Math.min(95, decision.confidence + 10);
+            decision._dualConfirmed = true;
+            decision._model = 'dual';
+            logger.info('DUAL CONFIRMED', {
               trade: decision.trade,
-              edge:  decision.edge
+              edge: decision.edge,
+              geminiConf: decision.confidence - 10,
+              sonnetTrade: sonnetDecision.trade
             });
           } else {
-            // Disagreement — be conservative
-            logger.info('Models DISAGREE — being conservative', {
+            logger.info('Models disagree — using Gemini', {
               gemini: decision.trade,
               sonnet: sonnetDecision.trade
             });
-            decision.trade  = 'SKIP';
-            decision.reason = 'model disagreement — skipping';
+            // Keep Gemini decision but reduce confidence
+            decision.confidence = Math.max(40, decision.confidence - 10);
+            decision._model = 'gemini';
+            decision._dualConfirmed = false;
           }
         }
+      } else {
+        // Gemini only (most common path)
+        decision._model = 'gemini';
+        decision._dualConfirmed = false;
       }
 
-      // Track which model made the final decision
-      decision._model        = usedSonnet ? 'sonnet' : 'gemini';
-      decision._dualConfirmed = decision.dualConfirmed || false;
+      if (!decision) {
+        logger.warn(`[${this.name}] No decision available for market`, {
+          market: market.question?.slice(0, 50)
+        });
+        continue;
+      }
 
+      // Track cost (approximate)
+      const geminiCost = 0.0005;   // ~$0.0005 per Gemini call
+      const sonnetCost = 0.015;    // ~$0.015 per Sonnet call
+      
+      stateStore.sessionCost = (stateStore.sessionCost || 0) + 
+        (usedSonnet ? sonnetCost + geminiCost : geminiCost);
+      
+      // Log cost milestone every $1
+      if (Math.floor(stateStore.sessionCost) > Math.floor(stateStore.sessionCost - (usedSonnet ? sonnetCost + geminiCost : geminiCost))) {
+        logger.info('Cost milestone', { 
+          total: '$' + stateStore.sessionCost.toFixed(2),
+          model: decision._model
+        });
+      }
+
+      decision.market_probability = market.marketProb ?? this._getMarketProbability(market);
       await this._finalizeDecision(market, decision, scanId);
     }
   }
 
-  // ── MODEL 1: Haiku Scout ──────────────────────────────────────────────────
-  // Fast first-pass filter. No news context. Cheap.
+  // ── Rule-based Scout — instant, zero API calls ───────────────────────────
 
-  async scoutMarket(market, scanId) {
-    const question   = market.question || market.title || 'Unknown market';
-    const marketProb = this._getMarketProbability(market);
-    const volume     = parseFloat(market.volume24hr || market.volume || 0).toFixed(0);
-    const liquidity  = parseFloat(market.liquidity || 0).toFixed(0);
-    const ctx = { scanId, agent: this.name, market: question.slice(0, 80), marketProb, volume, liquidity };
+  _ruleBasedScout(market) {
+    const prob = this._getMarketProbability(market);
+    const vol  = parseFloat(market.volume24hr || market.volume || 0);
+    const liq  = parseFloat(market.liquidity || 0);
 
-    const prompt = `Evaluate this prediction market for trading potential.
+    const pass = prob >= 5 && prob <= 95 &&
+                 vol >= 100000 && liq >= 50000;
 
-Market: "${question}"
-Probability: ${marketProb}%
-24h Volume: $${volume}
-Liquidity: $${liquidity}
-
-Respond with ONLY this JSON, nothing else, no markdown:
-{"worth_analyzing":true,"reason":"brief reason"}`;
-
-    // Increment scouted counter
     stateStore.incrementAgentCounter(this.name, 'scoutedCount');
+    if (pass) stateStore.incrementAgentCounter(this.name, 'approvedCount');
+    else      stateStore.incrementAgentCounter(this.name, 'filteredCount');
 
-    try {
-      const t0  = Date.now();
-      const msg = await this._client.messages.create({
-        model:      SCOUT_MODEL,
-        max_tokens: 120,
-        messages:   [{ role: 'user', content: prompt }]
-      });
-      const elapsed = Date.now() - t0;
-      const rawText = msg.content[0].text;
-      logger.debug(`[${this.name}] Haiku raw response`, { agent: this.name, raw: rawText.slice(0, 200) });
+    logger.debug(`[${this.name}] Rule scout: ${pass ? 'PASS' : 'SKIP'}`, {
+      prob, vol: (vol / 1000).toFixed(0) + 'k', liq: (liq / 1000).toFixed(0) + 'k'
+    });
 
-      let result;
-      try {
-        result = extractJSON(rawText);
-      } catch {
-        logger.warn(`[${this.name}] Haiku JSON parse FAILED — failing open`, {
-          ...ctx, raw: rawText.slice(0, 150), latencyMs: elapsed,
-          hint: 'Defaulting to worth_analyzing: true so Sonnet can decide'
-        });
-        stateStore.incrementAgentCounter(this.name, 'approvedCount');
-        return true;
-      }
+    return { worth_analyzing: pass, reason: pass ? 'rule pass' : 'rule skip' };
+  }
 
-      const worth = result.worth_analyzing === true;
-      const reason = result.reason || '';
-
-      logger.info(`[${this.name}] [Scout] ${worth ? 'PASS' : 'SKIP'} — ${reason}`, {
-        ...ctx, latencyMs: elapsed, model: SCOUT_MODEL
-      });
-
-      if (worth) {
-        stateStore.incrementAgentCounter(this.name, 'approvedCount');
-        stateStore.addNews({
-          agent: this.name,
-          text:  `[Scout PASS] ${question.slice(0, 65)} — ${reason}`,
-          type:  'signal'
-        });
-      } else {
-        stateStore.incrementAgentCounter(this.name, 'filteredCount');
-        stateStore.addNews({
-          agent: this.name,
-          text:  `[Scout SKIP] ${question.slice(0, 65)} — ${reason}`,
-          type:  'skip'
-        });
-      }
-
-      return worth;
-    } catch (err) {
-      const code = this._logClaudeError(err, 'Haiku Scout', ctx);
-      if (code === 'auth_error' || code === 'credits_exhausted') {
-        logger.error(`[${this.name}] INVALID API KEY or NO CREDITS — stopping engine`);
-        stateStore.setEngineRunning(false);
-        return false;
-      }
-      if (code === 'rate_limited') {
-        logger.warn(`[${this.name}] Rate limited — pausing agent for 30 seconds`);
-        await delay(30000);
-      }
-      // Fail open — Haiku errors should not block Sonnet analysis
-      logger.warn(`[${this.name}] Haiku error — failing open (worth_analyzing: true)`, {
-        hint: 'Sonnet will make the final call'
-      });
-      stateStore.incrementAgentCounter(this.name, 'approvedCount');
-      return true;
-    }
+  async scoutMarket(market) {
+    // Rule-based scout — instant, no API calls needed
+    return this._ruleBasedScout(market);
   }
 
   // ── MODEL 2: Sonnet Arbiter ───────────────────────────────────────────────
@@ -530,6 +519,15 @@ Analyze this market for mispricing. Output valid JSON only.`;
       return decision;
 
     } catch (e) {
+      // Check if credits exhausted — switch to Gemini permanently
+      if (e.status === 402 || 
+          e.message?.includes('credit') || 
+          e.message?.includes('too low')) {
+        global._anthropicExhausted = true;
+        logger.warn('Anthropic credits exhausted — Gemini will handle all analysis');
+        return null;  // Gemini will handle it in the scan loop
+      }
+      
       logger.error('[Sonnet Judge] API call FAILED', {
         message:      e.message,
         status:       e.status,
@@ -541,10 +539,6 @@ Analyze this market for mispricing. Output valid JSON only.`;
       if (e.status === 401) {
         logger.error('AUTH ERROR — ANTHROPIC_API_KEY is invalid or revoked');
         logger.error('Go to console.anthropic.com → API Keys → verify key is active');
-        stateStore.setEngineRunning(false);
-        return null;
-      } else if (e.status === 402) {
-        logger.error('PAYMENT REQUIRED — add credits at console.anthropic.com');
         stateStore.setEngineRunning(false);
         return null;
       } else if (e.status === 429) {
