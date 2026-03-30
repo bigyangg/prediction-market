@@ -13,6 +13,7 @@ const riskManager = require('../core/riskManager');
 const polymarketClient = require('../core/polymarketClient');
 const supervisor = require('../core/supervisor');
 const geminiJudge = require('../core/geminiJudge');
+const tradingRules = require('../core/tradingRules');
 const axios = require('axios');
 
 class BTCFastAgent {
@@ -29,12 +30,20 @@ class BTCFastAgent {
 
     // Trade management
     this.lastTradeTime = 0;
-    this.minTimeBetweenTrades = 5 * 60 * 1000;  // 5 min cooldown
+    this.minTimeBetweenTrades = tradingRules.RULES.ENTRY.cooldownSeconds * 1000;
     this.tradesWon = 0;
     this.tradesLost = 0;
     this.consecutiveLosses = 0;
     this.geminiChecksToday = 0;
     this.maxGeminiChecksPerDay = 10;
+
+    // Market cache
+    this._cachedMarket = null;
+    this._marketCacheTime = 0;
+
+    // Position monitoring
+    this._positionMonitorId = null;
+    this._activePosition = null;
   }
 
   // ── Price Data ─────────────────────────────────────────────────────────────
@@ -323,78 +332,138 @@ class BTCFastAgent {
     }
   }
 
-  // ── Market Finder ──────────────────────────────────────────────────────────
+  // ── Market Finder (FIXED: Exact pattern matching for 5-min markets) ─────────
 
-  async findBTCMarket() {
-    try {
-      // Try cache first
-      let markets = await polymarketClient.getActiveMarkets('crypto');
-      logger.info('BTCFastAgent: findBTCMarket', { 
-        totalMarkets: markets?.length || 0 
+  async findBTC5MinMarket() {
+    const RULES = tradingRules.RULES;
+    const cacheAge = (Date.now() - this._marketCacheTime) / 1000;
+    
+    // Return cached market if still valid
+    if (this._cachedMarket && cacheAge < RULES.MARKET.cacheSeconds) {
+      logger.debug('BTCFastAgent: using cached market', { 
+        cacheAge: cacheAge.toFixed(0) + 's',
+        question: this._cachedMarket.question?.slice(0, 50)
       });
-      
-      // Filter for BTC markets
-      let btc = this.filterBTCMarkets(markets);
-      
-      // Check if any have valid token IDs
-      let validMarket = btc.find(m => m.clobTokenIds?.length > 0 || m.tokenIds?.length > 0);
-      
-      // If cache doesn't have token IDs, fetch fresh from Gamma API
-      if (!validMarket && btc.length > 0) {
-        logger.info('BTCFastAgent: cache missing token IDs, fetching from Gamma API');
-        try {
-          const axios = require('axios');
-          const res = await axios.get('https://gamma-api.polymarket.com/markets', {
-            params: { active: true, closed: false, limit: 50, order: 'volume24hr', ascending: false },
-            timeout: 10000
-          });
-          
-          const fresh = Array.isArray(res.data) ? res.data : [];
-          const freshBtc = fresh.filter(m => {
-            const q = (m.question || '').toLowerCase();
-            return (q.includes('btc') || q.includes('bitcoin'));
-          });
-          
-          if (freshBtc.length > 0) {
-            // Parse clobTokenIds from JSON string
-            const market = freshBtc[0];
-            let tokenIds = market.clobTokenIds;
-            if (typeof tokenIds === 'string') {
-              try { tokenIds = JSON.parse(tokenIds); } catch { tokenIds = []; }
-            }
-            
-            logger.info('BTCFastAgent: fresh market from Gamma', {
-              question: market.question?.slice(0, 80),
-              tokenIds: tokenIds?.slice(0, 2),
-              hasTokens: tokenIds?.length > 0
-            });
-            
-            if (tokenIds?.length > 0) {
-              return {
-                ...market,
-                clobTokenIds: tokenIds,
-                tokenIds: tokenIds,
-                marketProb: Math.round(parseFloat(market.outcomePrices?.[0] || market.bestAsk || 0.5) * 100)
-              };
-            }
-          }
-        } catch (e) {
-          logger.warn('BTCFastAgent: Gamma API fetch failed', { error: e.message });
+      return this._cachedMarket;
+    }
+
+    try {
+      // Fetch fresh from Gamma API
+      const res = await axios.get('https://gamma-api.polymarket.com/markets', {
+        params: { 
+          active: true, 
+          closed: false, 
+          limit: 100, 
+          order: 'volume24hr', 
+          ascending: false 
+        },
+        timeout: 10000
+      });
+
+      const markets = Array.isArray(res.data) ? res.data : [];
+      logger.info('BTCFastAgent: fetched markets from Gamma', { count: markets.length });
+
+      // Find valid 5-min BTC market using strict pattern matching
+      for (const m of markets) {
+        const question = m.question || '';
+        
+        // Validate pattern
+        const patternCheck = tradingRules.validateMarketPattern(question);
+        if (!patternCheck.isValid) continue;
+
+        // Parse token IDs
+        let tokenIds = m.clobTokenIds;
+        if (typeof tokenIds === 'string') {
+          try { tokenIds = JSON.parse(tokenIds); } catch { tokenIds = []; }
         }
-      }
-      
-      if (validMarket) {
-        // Normalize tokenIds field
-        validMarket.clobTokenIds = validMarket.clobTokenIds || validMarket.tokenIds || [];
+        if (!tokenIds || tokenIds.length < RULES.MARKET.minTokens) {
+          logger.debug('BTCFastAgent: market missing token IDs', { 
+            question: question.slice(0, 50) 
+          });
+          continue;
+        }
+
+        // Parse prices
+        let prices = m.outcomePrices;
+        if (typeof prices === 'string') {
+          try { prices = JSON.parse(prices); } catch { prices = []; }
+        }
+        const yesPrice = parseFloat(prices[0] || 0.5);
+        const noPrice = parseFloat(prices[1] || 0.5);
+        const spread = Math.abs(yesPrice + noPrice - 1);
+
+        // Check liquidity
+        const liquidity = parseFloat(m.liquidity || m.liquidityNum || 0);
+        if (liquidity < RULES.ENTRY.minLiquidity) {
+          logger.debug('BTCFastAgent: market low liquidity', { 
+            liquidity, 
+            min: RULES.ENTRY.minLiquidity 
+          });
+          continue;
+        }
+
+        // Check spread
+        if (spread > RULES.ENTRY.maxSpread) {
+          logger.debug('BTCFastAgent: market high spread', { 
+            spread: (spread * 100).toFixed(1) + '%',
+            max: (RULES.ENTRY.maxSpread * 100) + '%'
+          });
+          continue;
+        }
+
+        // Calculate time to resolution
+        let secondsToResolution = null;
+        if (m.endDate) {
+          const endTime = new Date(m.endDate).getTime();
+          secondsToResolution = Math.max(0, (endTime - Date.now()) / 1000);
+        }
+
+        // Build validated market object
+        const validMarket = {
+          id: m.id,
+          conditionId: m.conditionId,
+          question: question,
+          yesTokenId: tokenIds[0],
+          noTokenId: tokenIds[1],
+          clobTokenIds: tokenIds,
+          yesPrice,
+          noPrice,
+          spread,
+          liquidity,
+          marketProb: Math.round(yesPrice * 100),
+          secondsToResolution,
+          endDate: m.endDate,
+          volume24hr: parseFloat(m.volume24hr || 0),
+        };
+
+        // Cache it
+        this._cachedMarket = validMarket;
+        this._marketCacheTime = Date.now();
+
+        logger.info('BTCFastAgent: found valid 5-min market', {
+          question: question.slice(0, 60),
+          liquidity: '$' + liquidity.toFixed(0),
+          spread: (spread * 100).toFixed(1) + '%',
+          yesPrice: yesPrice.toFixed(3),
+          secondsToResolution: secondsToResolution ? Math.round(secondsToResolution) + 's' : 'unknown'
+        });
+
         return validMarket;
       }
-      
-      logger.warn('BTCFastAgent: no BTC market with valid token IDs');
+
+      logger.warn('BTCFastAgent: no valid 5-min BTC market found');
+      this._cachedMarket = null;
       return null;
+
     } catch (e) {
-      logger.warn('BTCFastAgent: findBTCMarket failed', { error: e.message });
-      return null;
+      logger.warn('BTCFastAgent: Gamma API failed', { error: e.message });
+      return this._cachedMarket; // Return stale cache on error
     }
+  }
+
+  // Legacy method - redirect to new implementation
+  async findBTCMarket() {
+    return this.findBTC5MinMarket();
   }
   
   filterBTCMarkets(markets) {
@@ -487,21 +556,51 @@ class BTCFastAgent {
 
       if (histLen < 3) return;  // need minimum history
 
-      // 4. Cooldown check
-      const cooldownRemaining = this.minTimeBetweenTrades - (Date.now() - this.lastTradeTime);
+      // 4. Regime detection - skip trading in bad conditions
+      const regimeData = {
+        volatilityPctPerMin: ta?.avgMove || 0,
+        range24hPct: btcData.high24h && btcData.low24h 
+          ? ((btcData.high24h - btcData.low24h) / btcData.low24h) * 100 
+          : 999,
+        orderBookRatio: parseFloat(orderBook?.ratio || 0.5)
+      };
+      const regimeCheck = tradingRules.evaluateRegime(regimeData);
+      if (!regimeCheck.canTrade) {
+        logger.info('BTCFastAgent: regime skip', { reason: regimeCheck.reason });
+        return;
+      }
+
+      // 5. Skip if already have active position
+      if (this._activePosition) {
+        logger.debug('BTCFastAgent: already have active position');
+        return;
+      }
+
+      // 6. Rule-based cooldown check
+      const state = this.getState();
+      const cooldownRemaining = tradingRules.RULES.ENTRY.cooldownSeconds - state.secondsSinceLastTrade;
       if (cooldownRemaining > 0) {
-        logger.debug('BTCFastAgent: cooldown', { remaining: Math.ceil(cooldownRemaining / 1000) + 's' });
+        logger.debug('BTCFastAgent: cooldown', { remaining: Math.ceil(cooldownRemaining) + 's' });
         return;
       }
 
-      // 5. Find live BTC market
-      const market = await this.findBTCMarket();
+      // 7. Find live BTC 5-min market (with validation)
+      const market = await this.findBTC5MinMarket();
       if (!market) {
-        logger.debug('BTCFastAgent: no BTC market found');
+        logger.debug('BTCFastAgent: no valid 5-min BTC market found');
         return;
       }
 
-      // 6. Generate multi-signal decision
+      // 8. Check time to resolution
+      if (market.secondsToResolution !== null && 
+          market.secondsToResolution < tradingRules.RULES.ENTRY.minTimeToResolution) {
+        logger.info('BTCFastAgent: market too close to resolution', {
+          secondsToResolution: market.secondsToResolution
+        });
+        return;
+      }
+
+      // 9. Generate multi-signal decision
       logger.info('BTCFastAgent: calling generateSignal', { 
         ta: !!ta, 
         marketProb: market.marketProb,
@@ -524,6 +623,16 @@ class BTCFastAgent {
         return;
       }
 
+      // 8. Use rule engine for entry validation
+      const entryCheck = tradingRules.evaluateEntry(signal, market, state);
+      if (!entryCheck.canEnter) {
+        logger.info('BTCFastAgent: entry blocked by rules', { 
+          reason: entryCheck.reason,
+          failedChecks: entryCheck.failedChecks
+        });
+        return;
+      }
+
       logger.info('BTCFastAgent SIGNAL DETECTED', {
         direction: signal.signal,
         score: signal.score + '/100',
@@ -533,7 +642,6 @@ class BTCFastAgent {
         bearishPoints: signal.bearishPoints,
         reasons: signal.reasons,
         orderBook: orderBook?.signal || 'N/A',
-        dynamicThreshold: ta.strongThreshold?.toFixed(4) + '%',
         marketProb: (market.marketProb || 50) + '%',
         trueProb: signal.trueProbability.toFixed(0) + '%'
       });
@@ -571,10 +679,11 @@ class BTCFastAgent {
         this.geminiChecksToday++;
       }
 
-      // 7. Calculate Kelly stake
-      const stake = this.calculateStake(signal);
+      // 10. Calculate stake using rule engine
+      const stakeCalc = tradingRules.calculatePositionSize(signal, state);
+      const stake = stakeCalc.stake;
 
-      // 8. Final risk manager approval
+      // 11. Final risk manager approval
       const approval = riskManager.approve({
         trade:              signal.signal,
         edge:               signal.edge,
@@ -583,8 +692,8 @@ class BTCFastAgent {
         market_probability: market.marketProb || 50,
         risk_level:         signal.confidence > 70 ? 'LOW' : 'MEDIUM'
       }, riskManager.openTrades?.size || 0, {
-        minEdge:          5,
-        minConfidence:    55,
+        minEdge:          tradingRules.RULES.ENTRY.minEdge,
+        minConfidence:    tradingRules.RULES.ENTRY.minConfidence,
         stakeMultiplier:  0.3
       });
 
@@ -593,16 +702,14 @@ class BTCFastAgent {
         return;
       }
 
-      // 9. Execute — get token ID for the side we want
-      // YES = clobTokenIds[0], NO = clobTokenIds[1]
-      const tokenIndex = signal.signal === 'YES' ? 0 : 1;
-      const tokenId = market.clobTokenIds?.[tokenIndex] || market.tokenId;
+      // 12. Execute — get token ID for the side we want
+      const tokenId = signal.signal === 'YES' ? market.yesTokenId : market.noTokenId;
       
       if (!tokenId) {
         logger.error('BTCFastAgent: no token ID for trade', { 
           market: market.question?.slice(0, 60),
-          clobTokenIds: market.clobTokenIds,
-          tokenId: market.tokenId
+          yesTokenId: market.yesTokenId,
+          noTokenId: market.noTokenId
         });
         return;
       }
@@ -611,7 +718,7 @@ class BTCFastAgent {
       
       const result = await polymarketClient.placeOrder({
         tokenId,
-        side:           signal.signal,
+        side:           'BUY',  // Always BUY to enter position
         usdcAmount:     stake,
         marketQuestion: market.question
       });
@@ -619,9 +726,24 @@ class BTCFastAgent {
       if (result?.success !== false) {
         this.lastTradeTime = Date.now();
 
+        // Track active position for exit monitoring
+        const entryPrice = signal.signal === 'YES' ? market.yesPrice : market.noPrice;
+        this._activePosition = {
+          side: signal.signal,
+          entryPrice,
+          stake,
+          market: market.question,
+          yesTokenId: market.yesTokenId,
+          noTokenId: market.noTokenId,
+          marketId: market.id,
+          entryTime: Date.now(),
+          btcPriceAtEntry: btcData.price
+        };
+
         logger.info('BTCFastAgent TRADE OPEN', {
           side:       signal.signal,
           stake:      '$' + stake,
+          entryPrice: entryPrice.toFixed(3),
           edge:       signal.edge.toFixed(1) + '%',
           confidence: signal.confidence.toFixed(0) + '%',
           score:      signal.score,
@@ -632,7 +754,7 @@ class BTCFastAgent {
         stateStore.addNews({
           type:  'trade',
           agent: this.name,
-          text:  `⚡ BTC ${signal.signal} | $${btcData.price.toLocaleString()} | ${signal.reasons[0]} | Edge: ${signal.edge.toFixed(0)}% | Score: ${signal.score}`
+          text:  `⚡ BTC ${signal.signal} @ ${entryPrice.toFixed(2)} | $${btcData.price.toLocaleString()} | ${signal.reasons[0]} | Edge: ${signal.edge.toFixed(0)}%`
         });
       }
 
@@ -696,6 +818,126 @@ BTC price: $${btcData.price.toLocaleString()}
     }
   }
 
+  // ── Position Monitoring & Exit System ──────────────────────────────────────
+
+  async monitorPositions() {
+    if (!this._activePosition) return;
+
+    const RULES = tradingRules.RULES;
+    const position = this._activePosition;
+
+    try {
+      // Get current market data
+      const market = await this.findBTC5MinMarket();
+      if (!market) {
+        logger.debug('BTCFastAgent: position monitor - no market data');
+        return;
+      }
+
+      // Determine current price for our side
+      const currentPrice = position.side === 'YES' ? market.yesPrice : market.noPrice;
+      const entryPrice = position.entryPrice;
+      
+      // Update position with current data
+      position.currentPrice = currentPrice;
+      position.secondsToResolution = market.secondsToResolution;
+
+      // Evaluate exit conditions
+      const exitCheck = tradingRules.evaluateExit(position);
+
+      logger.info('BTCFastAgent: position check', {
+        side: position.side,
+        entryPrice: entryPrice.toFixed(3),
+        currentPrice: currentPrice.toFixed(3),
+        pnlPct: exitCheck.pnlPct?.toFixed(1) + '%',
+        shouldExit: exitCheck.shouldExit,
+        reason: exitCheck.reason,
+        secondsToResolution: position.secondsToResolution?.toFixed(0) + 's'
+      });
+
+      if (exitCheck.shouldExit) {
+        await this.executeExit(position, exitCheck.reason, exitCheck.pnlPct);
+      }
+
+    } catch (e) {
+      logger.warn('BTCFastAgent: position monitor error', { error: e.message });
+    }
+  }
+
+  async executeExit(position, reason, pnlPct) {
+    logger.info('BTCFastAgent: executing exit', {
+      reason,
+      pnlPct: pnlPct?.toFixed(1) + '%',
+      side: position.side,
+      market: position.market?.slice(0, 50)
+    });
+
+    try {
+      // Determine SELL token - opposite of what we bought
+      // If we bought YES, we sell YES tokens
+      const tokenId = position.side === 'YES' ? position.yesTokenId : position.noTokenId;
+      
+      const result = await polymarketClient.placeOrder({
+        tokenId,
+        side: 'SELL',
+        usdcAmount: position.stake,
+        marketQuestion: position.market
+      });
+
+      if (result?.success !== false) {
+        // Record the exit
+        const isWin = pnlPct > 0;
+        if (isWin) {
+          this.tradesWon++;
+          this.consecutiveLosses = 0;
+        } else {
+          this.tradesLost++;
+          this.consecutiveLosses++;
+        }
+
+        stateStore.addNews({
+          type: isWin ? 'success' : 'error',
+          agent: this.name,
+          text: `${isWin ? '✅' : '❌'} EXIT ${reason}: ${pnlPct >= 0 ? '+' : ''}${pnlPct?.toFixed(1)}% | ${position.side} | ${position.market?.slice(0, 40)}`
+        });
+
+        logger.info('BTCFastAgent: exit executed', {
+          reason,
+          pnlPct: pnlPct?.toFixed(1) + '%',
+          isWin,
+          consecutiveLosses: this.consecutiveLosses
+        });
+
+        // Clear active position
+        this._activePosition = null;
+      }
+
+    } catch (e) {
+      logger.error('BTCFastAgent: exit failed', { error: e.message, reason });
+      // Don't clear position on error - will retry on next monitor cycle
+    }
+  }
+
+  startPositionMonitor() {
+    if (this._positionMonitorId) return;
+    
+    const RULES = tradingRules.RULES;
+    this._positionMonitorId = setInterval(
+      () => this.monitorPositions(),
+      RULES.EXIT.checkIntervalMs
+    );
+    logger.info('BTCFastAgent: position monitor started', {
+      interval: RULES.EXIT.checkIntervalMs + 'ms'
+    });
+  }
+
+  stopPositionMonitor() {
+    if (this._positionMonitorId) {
+      clearInterval(this._positionMonitorId);
+      this._positionMonitorId = null;
+    }
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   start() {
@@ -704,7 +946,7 @@ BTC price: $${btcData.price.toLocaleString()}
       return;
     }
     this.active = true;
-    logger.info('BTCFastAgent: started — multi-signal momentum strategy');
+    logger.info('BTCFastAgent: started — multi-signal momentum strategy with exit system');
     stateStore.updateAgent(this.name, {
       category: this.category,
       interval: '60s',
@@ -712,8 +954,13 @@ BTC price: $${btcData.price.toLocaleString()}
       active:   true,
       status:   'active'
     });
+    
+    // Start main scan loop
     this.scan();
     this.intervalId = setInterval(() => this.scan(), this.scanInterval);
+    
+    // Start position monitoring (every 15s)
+    this.startPositionMonitor();
     
     // Reset daily Gemini check counter at midnight
     this._resetIntervalId = setInterval(() => {
@@ -735,8 +982,22 @@ BTC price: $${btcData.price.toLocaleString()}
       clearInterval(this._resetIntervalId);
       this._resetIntervalId = null;
     }
+    this.stopPositionMonitor();
     stateStore.updateAgent(this.name, { status: 'stopped', active: false });
     logger.info('BTCFastAgent: stopped');
+  }
+
+  // ── State Getters ─────────────────────────────────────────────────────────
+
+  getState() {
+    return {
+      consecutiveLosses: this.consecutiveLosses,
+      losingStreak: this.consecutiveLosses,
+      openPositions: this._activePosition ? 1 : 0,
+      secondsSinceLastTrade: (Date.now() - this.lastTradeTime) / 1000,
+      dailyLossPct: Math.abs(stateStore.dailyPnl || 0) / tradingRules.RULES.RISK.capitalBase * 100,
+      capital: stateStore.usdcBalance || tradingRules.RULES.RISK.capitalBase,
+    };
   }
 }
 

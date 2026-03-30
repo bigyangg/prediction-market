@@ -642,6 +642,271 @@
     .green { color: var(--green); }
     .red   { color: var(--red);   }
     .yellow { color: var(--yellow); }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       MOBILE RESPONSIVE STYLES
+       ═══════════════════════════════════════════════════════════════════════ */
+
+    /* Tablet breakpoint */
+    @media (max-width: 1024px) {
+      .main {
+        grid-template-columns: 1fr 260px;
+      }
+      
+      .stats-row {
+        grid-template-columns: repeat(3, 1fr);
+      }
+      
+      .agents-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    /* Mobile breakpoint */
+    @media (max-width: 768px) {
+      html, body {
+        font-size: 12px;
+      }
+
+      header {
+        padding: 0 12px;
+        height: 48px;
+        flex-wrap: wrap;
+      }
+
+      .logo {
+        font-size: 12px;
+        letter-spacing: 2px;
+      }
+
+      .header-right {
+        gap: 10px;
+      }
+
+      .header-status {
+        gap: 8px;
+      }
+
+      .wallet-info {
+        display: none;
+      }
+
+      /* Stack layout on mobile */
+      .main {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: calc(100vh - 48px);
+      }
+
+      .left {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+        gap: 10px;
+        overflow-y: visible;
+      }
+
+      .right {
+        padding: 10px 12px;
+        gap: 10px;
+        overflow-y: visible;
+      }
+
+      /* Stats - 2 columns on mobile */
+      .stats-row {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .stat-cell {
+        padding: 10px 8px;
+      }
+
+      .stat-cell .sv {
+        font-size: 14px;
+      }
+
+      /* Agents - 1 column on mobile */
+      .agents-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .agent-card {
+        padding: 10px 12px;
+      }
+
+      .agent-name {
+        font-size: 12px;
+      }
+
+      /* Panels */
+      .panel {
+        margin-bottom: 8px;
+      }
+
+      .panel-head {
+        padding: 8px 10px;
+        font-size: 10px;
+      }
+
+      .panel-body {
+        padding: 8px 10px;
+      }
+
+      /* News feed - shorter on mobile */
+      .news-wrap {
+        max-height: 180px;
+      }
+
+      .news-item {
+        padding: 6px 8px;
+        font-size: 11px;
+      }
+
+      /* Charts */
+      .chart-wrap {
+        height: 120px !important;
+        min-height: 120px !important;
+      }
+
+      /* Trade history */
+      .trades-wrap {
+        max-height: 200px;
+      }
+
+      .trade-row {
+        padding: 6px 8px;
+        font-size: 11px;
+      }
+
+      /* Positions */
+      .positions-wrap {
+        max-height: 180px;
+      }
+
+      .pos-row {
+        padding: 6px 8px;
+        font-size: 11px;
+      }
+
+      /* Form elements */
+      .form-row input,
+      .form-row select {
+        padding: 8px 10px;
+        font-size: 14px;
+      }
+
+      .btn {
+        padding: 10px 14px;
+        font-size: 12px;
+      }
+
+      /* Section labels */
+      .section-label {
+        font-size: 10px;
+        margin-bottom: 8px;
+      }
+    }
+
+    /* Small mobile breakpoint */
+    @media (max-width: 480px) {
+      header {
+        height: auto;
+        padding: 8px 10px;
+        gap: 6px;
+      }
+
+      .logo {
+        width: 100%;
+        text-align: center;
+        margin-bottom: 4px;
+      }
+
+      .header-right {
+        width: 100%;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .header-status {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+      }
+
+      #engine-pill,
+      #mode-pill,
+      #tf-pill {
+        font-size: 9px;
+      }
+
+      .main {
+        min-height: calc(100vh - 80px);
+      }
+
+      .left,
+      .right {
+        padding: 8px 10px;
+      }
+
+      /* Stats - 2 columns, compact */
+      .stats-row {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .stat-cell {
+        padding: 8px 6px;
+      }
+
+      .stat-cell .sl {
+        font-size: 8px;
+      }
+
+      .stat-cell .sv {
+        font-size: 13px;
+      }
+
+      /* Hide less important elements */
+      .scout-row {
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .scout-item {
+        font-size: 8px;
+      }
+
+      /* Compact agent cards */
+      .agent-card {
+        padding: 8px 10px;
+      }
+
+      .agent-meta {
+        font-size: 8px;
+      }
+    }
+
+    /* Touch-friendly adjustments */
+    @media (hover: none) and (pointer: coarse) {
+      .btn {
+        min-height: 44px;
+        min-width: 44px;
+      }
+
+      .agent-card {
+        padding: 12px;
+      }
+
+      .trade-row,
+      .pos-row,
+      .news-item {
+        padding: 10px 8px;
+      }
+
+      input, select, button {
+        min-height: 44px;
+      }
+    }
   </style>
 </head>
 <body>
